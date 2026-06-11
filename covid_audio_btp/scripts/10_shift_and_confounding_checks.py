@@ -35,8 +35,9 @@ def main() -> None:
     args = parse_args()
     predictions = pd.read_csv(args.predictions)
     metadata = pd.read_csv(args.metadata)
-    cols = ["recording_id", "quality_flag", "age", "gender", "country"]
-    merged = predictions.merge(metadata[[c for c in cols if c in metadata.columns]], on="recording_id", how="left")
+    cols = ["recording_id", "participant_id", "quality_flag", "age", "gender", "country"]
+    merge_key = "recording_id" if "recording_id" in predictions.columns else "participant_id"
+    merged = predictions.merge(metadata[[c for c in cols if c in metadata.columns]], on=merge_key, how="left")
     if "age" in merged.columns:
         merged["age_bucket"] = merged["age"].map(_age_bucket)
     group_columns = [c for c in ["quality_flag", "gender", "age_bucket"] if c in merged.columns]

@@ -23,3 +23,12 @@ data/outputs/
 reports/
 .ipynb_checkpoints/
 .pytest_cache/
+
+# Local datasets and generated artifacts
+data/raw/
+data/interim/
+data/processed/
+data/outputs/
+reports/
+.cache/
+.ipynb_checkpoints/

@@ -70,7 +70,12 @@ def extract_feature_table(metadata: pd.DataFrame, quality_mode: str = "all_sampl
         df = df[df["quality_flag"] == "ok"]
     elif quality_mode not in {"all_samples", "quality_ok_only"}:
         raise ValueError(f"Unknown quality_mode: {quality_mode}")
-    rows = [extract_features_for_row(row) for _, row in df.iterrows()]
+    rows = []
+    for _, row in df.iterrows():
+        try:
+            rows.append(extract_features_for_row(row))
+        except Exception as e:
+            print(f"WARNING: skipping {row.get('audio_path', '?')} — {e}")
     return pd.DataFrame(rows)
 
 

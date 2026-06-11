@@ -52,6 +52,14 @@ def load_audio(path: str | Path, config: AudioConfig = AUDIO_CONFIG) -> tuple[np
         original_sample_rate: source sample rate before resampling
     """
     with local_audio_path(path) as resolved_path:
+        if resolved_path.name.startswith("._"):
+            real_path = resolved_path.parent / resolved_path.name[2:]
+            if real_path.exists():
+                resolved_path = real_path
+            else:
+                raise FileNotFoundError(
+                    f"Apple Double stub found but real file missing: {real_path}"
+                )
         try:
             y, original_sr = sf.read(resolved_path, always_2d=False)
             if y.ndim > 1:
