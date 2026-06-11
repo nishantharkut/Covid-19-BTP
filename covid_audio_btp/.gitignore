@@ -13,3 +13,13 @@ reports/tables/
 *.joblib
 *.pkl
 
+
+# Local generated files
+src/covid_audio_btp.egg-info/
+data/raw/
+data/interim/
+data/processed/
+data/outputs/
+reports/
+.ipynb_checkpoints/
+.pytest_cache/

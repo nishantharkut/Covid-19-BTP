@@ -1,5 +1,0 @@
-Metadata-Version: 2.4
-Name: covid-audio-btp
-Version: 0.1.0
-Summary: Reliability-aware respiratory audio screening research prototype
-Requires-Python: >=3.10
