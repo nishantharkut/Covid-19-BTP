@@ -14,7 +14,7 @@ https://github.com/iiscleap/Coswara-Data
 Place it here after setup:
 
 ```text
-/home/ubuntu/nishn_workspce/test_pdfs_generic/.covid_audio_btp_private/covid_audio_btp/data/raw/coswara
+<PROJECT_ROOT>/data/raw/coswara
 ```
 
 Optional after the Coswara pipeline works:
@@ -27,7 +27,7 @@ https://zenodo.org/records/7024894
 Place it here only for external cough validation:
 
 ```text
-/home/ubuntu/nishn_workspce/test_pdfs_generic/.covid_audio_btp_private/covid_audio_btp/data/raw/coughvid
+<PROJECT_ROOT>/data/raw/coughvid
 ```
 
 Do not download mutation, genomic, wet-lab, variant-prediction, or sequence-analysis data for this audio-only build.
@@ -35,7 +35,7 @@ Do not download mutation, genomic, wet-lab, variant-prediction, or sequence-anal
 ## First Setup
 
 ```bash
-cd /home/ubuntu/nishn_workspce/test_pdfs_generic/.covid_audio_btp_private/covid_audio_btp
+cd <PROJECT_ROOT>
 python -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
@@ -106,7 +106,7 @@ reports/tables/validation_issues.csv
 Use this after moving or copying the project:
 
 ```bash
-chmod -R go-rwx /home/ubuntu/nishn_workspce/test_pdfs_generic/.covid_audio_btp_private
+chmod -R go-rwx <PRIVATE_CODEX_WORKSPACE>
 ```
 
 This project now uses the persistent hidden workspace folder, not `/tmp`. Keep backups of final code, reports, and trained models when needed.

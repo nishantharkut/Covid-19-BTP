@@ -25,6 +25,37 @@ def _can_stratify(labels: pd.Series) -> bool:
     return len(counts) >= 2 and counts.min() >= 2
 
 
+def _age_bucket(value: object) -> str:
+    try:
+        age = float(value)
+    except Exception:
+        return "unknown"
+    if age < 30:
+        return "<30"
+    if age < 45:
+        return "30-44"
+    if age < 60:
+        return "45-59"
+    return "60+"
+
+
+def _gender_group(value: object) -> str:
+    text = str(value).strip().lower()
+    if text in {"m", "male"}:
+        return "male"
+    if text in {"f", "female"}:
+        return "female"
+    if text in {"other", "others", "nonbinary", "non-binary"}:
+        return "other"
+    return "unknown"
+
+
+def _first_nonempty(values: pd.Series, default: str = "unknown") -> object:
+    cleaned = values.dropna().astype(str).str.strip()
+    cleaned = cleaned[cleaned.ne("")]
+    return cleaned.iloc[0] if not cleaned.empty else default
+
+
 def _participant_table(metadata: pd.DataFrame) -> pd.DataFrame:
     supervised = metadata[metadata["label_binary"].isin(["positive", "negative"])].copy()
     if supervised.empty:
@@ -33,16 +64,38 @@ def _participant_table(metadata: pd.DataFrame) -> pd.DataFrame:
     def join_modalities(values: pd.Series) -> str:
         return ",".join(sorted(set(v for v in values.dropna().astype(str) if v and v != "unknown")))
 
-    table = (
-        supervised.groupby(["participant_id", "dataset"], dropna=False)
-        .agg(
-            label_binary=("label_binary", lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0]),
-            n_recordings=("recording_id", "nunique"),
-            modalities_available=("modality", join_modalities),
-        )
-        .reset_index()
+    aggregations = {
+        "label_binary": ("label_binary", lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0]),
+        "n_recordings": ("recording_id", "nunique"),
+        "modalities_available": ("modality", join_modalities),
+    }
+    if "age" in supervised.columns:
+        aggregations["age"] = ("age", _first_nonempty)
+    if "gender" in supervised.columns:
+        aggregations["gender"] = ("gender", _first_nonempty)
+
+    table = supervised.groupby(["participant_id", "dataset"], dropna=False).agg(**aggregations).reset_index()
+    if "age" not in table.columns:
+        table["age"] = "unknown"
+    if "gender" not in table.columns:
+        table["gender"] = "unknown"
+    table["age_bucket"] = table["age"].map(_age_bucket)
+    table["gender"] = table["gender"].map(_gender_group)
+    table["label_age_gender"] = (
+        table["label_binary"].astype(str) + "|" + table["age_bucket"].astype(str) + "|" + table["gender"].astype(str)
     )
+    table["label_age"] = table["label_binary"].astype(str) + "|" + table["age_bucket"].astype(str)
     return table
+
+
+def _best_stratify_series(participants: pd.DataFrame) -> tuple[pd.Series | None, str]:
+    for column in ("label_age_gender", "label_age", "label_binary"):
+        if column not in participants.columns:
+            continue
+        labels = participants[column].astype(str)
+        if _can_stratify(labels):
+            return labels, column
+    return None, "none"
 
 
 def create_participant_splits(
@@ -57,7 +110,7 @@ def create_participant_splits(
         raise ValueError("Split sizes must sum to 1.0")
 
     participants = _participant_table(metadata)
-    stratify = participants["label_binary"] if _can_stratify(participants["label_binary"]) else None
+    stratify, stratify_group = _best_stratify_series(participants)
 
     train_df, temp_df = train_test_split(
         participants,
@@ -68,7 +121,7 @@ def create_participant_splits(
 
     temp_ratio = config.validation_size + config.test_size
     validation_relative = config.validation_size / temp_ratio
-    temp_stratify = temp_df["label_binary"] if _can_stratify(temp_df["label_binary"]) else None
+    temp_stratify, temp_stratify_group = _best_stratify_series(temp_df)
     validation_df, test_df = train_test_split(
         temp_df,
         train_size=validation_relative,
@@ -85,6 +138,7 @@ def create_participant_splits(
         ignore_index=True,
     )
     split_manifest["split_seed"] = config.seed
+    split_manifest["split_stratify_group"] = stratify_group + ";temp=" + temp_stratify_group
     split_manifest = split_manifest[SPLIT_COLUMNS]
 
     metadata_with_split = metadata.copy()

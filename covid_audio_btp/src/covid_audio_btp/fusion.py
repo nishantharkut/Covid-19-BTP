@@ -42,7 +42,10 @@ def validation_weighted_fusion(
 ) -> pd.DataFrame:
     pivot = _pivot_predictions(predictions, probability_column)
     modality_cols = [col for col in ("cough", "breath", "speech") if col in pivot.columns]
-    metric_map = validation_metrics.set_index("modality")[metric_column].to_dict()
+    if metric_column in validation_metrics.columns and "modality" in validation_metrics.columns:
+        metric_map = validation_metrics.groupby("modality")[metric_column].max().to_dict()
+    else:
+        metric_map = {}
     raw_weights = np.array([max(float(metric_map.get(col, 0.5)) - 0.5, 0.0) for col in modality_cols])
     if raw_weights.sum() <= 0:
         raw_weights = np.ones(len(modality_cols))

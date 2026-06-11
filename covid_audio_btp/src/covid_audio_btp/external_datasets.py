@@ -142,6 +142,104 @@ def _sidecar_records_from_zip(zip_path: Path) -> list[dict[str, object]]:
     return rows
 
 
+def _find_metadata_member_in_zip(names: set[str]) -> str | None:
+    preferred = {"metadata_compiled.csv", "metadata.csv"}
+    for name in sorted(names):
+        if Path(name).name in preferred:
+            return name
+    for name in sorted(names):
+        lowered = Path(name).name.lower()
+        if lowered.endswith(".csv") and "metadata" in lowered:
+            return name
+    return None
+
+
+def _find_audio_member_in_zip(names: set[str], uuid: str) -> str | None:
+    for suffix in AUDIO_EXTENSIONS:
+        for candidate in (f"public_dataset/{uuid}{suffix}", f"{uuid}{suffix}"):
+            if candidate in names:
+                return candidate
+    for name in sorted(names):
+        path = Path(name)
+        if path.stem == uuid and path.suffix.lower() in AUDIO_EXTENSIONS:
+            return name
+    return None
+
+
+def _records_from_metadata_zip(zip_path: Path, require_audio: bool, min_cough_detected: float | None) -> list[dict[str, object]] | None:
+    with zipfile.ZipFile(zip_path) as zf:
+        names = set(zf.namelist())
+        metadata_member = _find_metadata_member_in_zip(names)
+        if metadata_member is None:
+            return None
+        with zf.open(metadata_member) as fh:
+            meta = pd.read_csv(fh)
+
+    uuid_col = _pick_column(list(meta.columns), ["uuid", "id", "recording_id"])
+    status_col = _pick_column(list(meta.columns), ["status_SSL", "status ssl", "status", "covid_status", "label"])
+    cough_col = _pick_column(list(meta.columns), ["cough_detected", "cough probability", "cough_prob"])
+    snr_col = _pick_column(list(meta.columns), ["snr", "SNR"])
+    age_col = _pick_column(list(meta.columns), ["age"])
+    gender_col = _pick_column(list(meta.columns), ["gender", "sex"])
+    country_col = _pick_column(list(meta.columns), ["country", "location"])
+    date_col = _pick_column(list(meta.columns), ["datetime", "recording_date", "date", "timestamp"])
+    latitude_col = _pick_column(list(meta.columns), ["latitude", "lat"])
+    longitude_col = _pick_column(list(meta.columns), ["longitude", "lon", "lng"])
+    respiratory_col = _pick_column(list(meta.columns), ["respiratory_condition", "respiratory condition"])
+    fever_col = _pick_column(list(meta.columns), ["fever_muscle_pain", "fever muscle pain"])
+    if uuid_col is None:
+        raise ValueError("COUGHVID metadata must contain uuid/id/recording_id")
+
+    rows: list[dict[str, object]] = []
+    for _, row in meta.iterrows():
+        uuid = str(row[uuid_col]).strip()
+        if not uuid or uuid.lower() == "nan":
+            continue
+        cough_score = row[cough_col] if cough_col else ""
+        if min_cough_detected is not None:
+            try:
+                if float(cough_score) < min_cough_detected:
+                    continue
+            except Exception:
+                continue
+        audio_member = _find_audio_member_in_zip(names, uuid)
+        if require_audio and audio_member is None:
+            continue
+        audio_path = f"{zip_path.as_posix()}::{audio_member}" if audio_member else f"{zip_path.as_posix()}::public_dataset/{uuid}.webm"
+        label_raw = row[status_col] if status_col else "unknown"
+        symptoms = {
+            "respiratory_condition": row[respiratory_col] if respiratory_col else "",
+            "fever_muscle_pain": row[fever_col] if fever_col else "",
+        }
+        rows.append(
+            {
+                "participant_id": uuid,
+                "recording_id": f"coughvid_{uuid}",
+                "dataset": "coughvid",
+                "modality": "cough",
+                "submodality": "cough",
+                "audio_path": audio_path,
+                "label_raw": label_raw,
+                "label_binary": normalize_coughvid_label(label_raw),
+                "recording_date": row[date_col] if date_col else "",
+                "age": row[age_col] if age_col else "",
+                "gender": row[gender_col] if gender_col else "",
+                "country": row[country_col] if country_col else "",
+                "latitude": row[latitude_col] if latitude_col else "",
+                "longitude": row[longitude_col] if longitude_col else "",
+                "respiratory_condition": row[respiratory_col] if respiratory_col else "",
+                "fever_muscle_pain": row[fever_col] if fever_col else "",
+                "symptoms_json": json.dumps(symptoms),
+                "comorbidities_json": json.dumps(symptoms),
+                "manual_quality_score": cough_score,
+                "manual_quality_label": _quality_label_from_cough_detected(cough_score),
+                "cough_detected": cough_score,
+                "snr_proxy": row[snr_col] if snr_col else "",
+            }
+        )
+    return rows
+
+
 def _records_from_csv(raw_dir: Path, metadata_path: Path, require_audio: bool, min_cough_detected: float | None) -> list[dict[str, object]]:
     meta = pd.read_csv(metadata_path)
     uuid_col = _pick_column(list(meta.columns), ["uuid", "id", "recording_id"])
@@ -222,7 +320,9 @@ def build_coughvid_index(
     """
     raw_dir = Path(raw_dir)
     if raw_dir.is_file() and raw_dir.suffix.lower() == ".zip" and metadata_path is None:
-        rows = _sidecar_records_from_zip(raw_dir)
+        rows = _records_from_metadata_zip(raw_dir, require_audio, min_cough_detected)
+        if rows is None:
+            rows = _sidecar_records_from_zip(raw_dir)
     else:
         if metadata_path is not None:
             rows = _records_from_csv(raw_dir, Path(metadata_path), require_audio, min_cough_detected)

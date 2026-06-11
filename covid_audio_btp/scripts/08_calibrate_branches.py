@@ -23,6 +23,8 @@ def parse_args() -> argparse.Namespace:
 
 def _fit_calibrator(method: str, validation: pd.DataFrame):
     y_val = labels_to_binary(validation["label_binary"])
+    if len(np.unique(y_val)) < 2:
+        return None
     if method == "temperature":
         if "logit" not in validation.columns:
             raise ValueError("Temperature scaling requires a logit column")
@@ -33,6 +35,8 @@ def _fit_calibrator(method: str, validation: pd.DataFrame):
 
 
 def _transform(calibrator, method: str, test: pd.DataFrame) -> np.ndarray:
+    if calibrator is None:
+        return test["probability"].astype(float).to_numpy()
     if method == "temperature":
         return calibrator.transform_logits(test["logit"].to_numpy())
     return calibrator.transform(test["probability"].to_numpy())
@@ -54,7 +58,7 @@ def main() -> None:
         calibrator = _fit_calibrator(args.method, val_group)
         test_group["raw_probability"] = test_group["probability"]
         test_group["probability"] = _transform(calibrator, args.method, test_group)
-        test_group["calibration_method"] = args.method
+        test_group["calibration_method"] = args.method if calibrator is not None else "identity_single_class_validation"
         output_frames.append(test_group)
         metrics = evaluate_predictions(test_group)
         metrics["model_name"] = model_name
@@ -62,11 +66,15 @@ def main() -> None:
         metrics["calibration_method"] = args.method
         metric_frames.append(metrics)
 
+    if not output_frames:
+        raise RuntimeError("No calibrated prediction groups were produced. Check ML validation/test prediction files.")
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    if output_frames:
-        pd.concat(output_frames, ignore_index=True).to_csv(args.output, index=False)
+    pd.concat(output_frames, ignore_index=True).to_csv(args.output, index=False)
     if metric_frames:
         pd.concat(metric_frames, ignore_index=True).to_csv(args.metrics_output, index=False)
+    else:
+        pd.DataFrame().to_csv(args.metrics_output, index=False)
     print(f"Wrote calibrated predictions: {args.output}")
     print(f"Wrote calibration metrics: {args.metrics_output}")
 

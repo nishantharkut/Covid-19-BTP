@@ -44,6 +44,9 @@ SPLIT_COLUMNS = [
     "label_binary",
     "n_recordings",
     "modalities_available",
+    "age_bucket",
+    "gender",
+    "split_stratify_group",
     "split_seed",
 ]
 

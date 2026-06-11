@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-05-26
+Last updated: 2026-06-11
 
 ## Current State
 
@@ -9,18 +9,36 @@ The project now has a private, notebook-first but module-backed implementation s
 Location:
 
 ```text
-/home/ubuntu/nishn_workspce/test_pdfs_generic/.covid_audio_btp_private/covid_audio_btp
+<PROJECT_ROOT>
 ```
 
 Privacy:
 
 ```text
-chmod -R go-rwx /home/ubuntu/nishn_workspce/test_pdfs_generic/.covid_audio_btp_private
+chmod -R go-rwx <PRIVATE_CODEX_WORKSPACE>
 ```
 
 has been applied after code generation.
 
 ## Completed
+
+### COUGHVID Zenodo Zip Support Hardened On 2026-06-11
+
+Updated the COUGHVID adapter to support both the Zenodo v1 `public_dataset.zip` sidecar-JSON layout and v3-style `metadata_compiled.csv` inside `public_dataset_v3.zip`. Added a regression test for v3 metadata inside a direct zip archive. Targeted publication-layer tests passed, and full regression tests passed with 44 tests.
+
+### Full Local Runbook Added On 2026-06-11
+
+Added `BTP_FULL_LOCAL_RUNBOOK.md` as the canonical first-run-to-final-BTP local execution guide. It includes setup commands, Coswara clone/extract flow, preflight, notebook toggles, expected timings, success files, stop conditions, COUGHVID cough-only extension, CNN guidance, final BTP packaging, and common error mitigations.
+
+### BTP And Publication Target Added On 2026-06-10
+
+Added `BTP_A_GRADE_AND_PUBLICATION_TARGET.md` to lock the project priorities:
+
+- primary goal is an A-grade BTP with a reproducible, working, defensible pipeline;
+- publication strength is a staged extension after real baseline results exist;
+- Gemini/PDF critiques are integrated as audit requirements and future ablations, not as a risky replacement for the baseline;
+- the lab T1000 8 GB GPU is treated as suitable for baseline/CNN/frozen embeddings, not full end-to-end SSL/GRL fine-tuning;
+- stop conditions are explicit so weak or confounded results are handled as research findings instead of hidden.
 
 Notebook-first upgrade completed on 2026-05-25:
 
@@ -94,13 +112,13 @@ quality audit has acceptable non-corrupt coverage
 Place Coswara data under:
 
 ```text
-/home/ubuntu/nishn_workspce/test_pdfs_generic/.covid_audio_btp_private/covid_audio_btp/data/raw/coswara
+<PROJECT_ROOT>/data/raw/coswara
 ```
 
 Then run:
 
 ```bash
-cd /home/ubuntu/nishn_workspce/test_pdfs_generic/.covid_audio_btp_private/covid_audio_btp
+cd <PROJECT_ROOT>
 source .venv/bin/activate
 python scripts/00_check_environment.py
 jupyter lab

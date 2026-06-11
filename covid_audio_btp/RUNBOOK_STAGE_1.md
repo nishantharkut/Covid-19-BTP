@@ -3,7 +3,7 @@
 Run these commands after placing Coswara under `data/raw/coswara`.
 
 ```bash
-cd /home/ubuntu/nishn_workspce/test_pdfs_generic/.covid_audio_btp_private/covid_audio_btp
+cd <PROJECT_ROOT>
 python -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip

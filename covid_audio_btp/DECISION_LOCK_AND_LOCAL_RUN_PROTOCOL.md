@@ -1,6 +1,6 @@
 # Decision Lock And Local Run Protocol
 
-Last updated: 2026-06-03
+Last updated: 2026-06-10
 
 This file records the current decisions so the next local run and later debugging stay consistent.
 
@@ -22,12 +22,19 @@ EC2/Codex side:
 
 Use a hybrid, staged plan:
 
-1. First prove the current Coswara baseline pipeline works.
-2. Then run cough-only external validation with COUGHVID.
-3. Then add acoustic-domain proxy analysis.
-4. Add SSL/GRL/adversarial modules only as an advanced ablation after baseline evidence exists.
+1. First prove the current Coswara baseline pipeline works and produces A-grade BTP artifacts.
+2. Then enable publication-strength diagnostics that do not require new datasets.
+3. Then run cough-only external validation with COUGHVID.
+4. Then add acoustic-domain proxy analysis.
+5. Add SSL/GRL/adversarial modules only as an advanced ablation after baseline evidence exists.
 
 Do not replace the current implementation with the Gemini adversarial plan. Treat that plan as a future publication extension, not the survival path.
+
+The grading/publication target is recorded in:
+
+```text
+BTP_A_GRADE_AND_PUBLICATION_TARGET.md
+```
 
 ## Immediate Local Run Target
 
@@ -101,12 +108,14 @@ RAM: 16-32 GB
 Future Wav2Vec/HuBERT/GRL extension:
 
 ```text
-GPU: 12-16 GB VRAM minimum
-RAM: 32 GB preferred
+GPU: 12-16 GB VRAM minimum for end-to-end fine-tuning
+RAM: 32 GB preferred for end-to-end fine-tuning
 Disk: 80-150 GB free
 ```
 
-Current decision: do not enable CNN or SSL/GRL before the Coswara baseline completes.
+The known lab machine has a T1000 8 GB GPU and 19 GB RAM. It is suitable for the baseline, compact CNN, and carefully batched frozen SSL embedding extraction. It is not the right first choice for end-to-end SSL/GRL fine-tuning.
+
+Current decision: do not enable CNN or SSL/GRL before the Coswara baseline completes. If advanced SSL is attempted later on the T1000, use frozen embeddings first, batch size 1-4, and lightweight classifiers.
 
 ## First Success Gate
 
@@ -198,6 +207,7 @@ Allowed:
 
 ```text
 We evaluate reliability, calibration, quality sensitivity, and domain shift in respiratory-audio screening.
+The primary BTP contribution is a reproducible and leakage-safe research framework, not a clinical diagnostic system.
 ```
 
 Not allowed:

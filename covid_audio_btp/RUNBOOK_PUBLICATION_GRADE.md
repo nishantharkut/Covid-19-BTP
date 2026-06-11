@@ -7,7 +7,7 @@ This runbook extends the notebook-first Coswara workflow with the experiments ne
 Install the project environment first:
 
 ```bash
-cd /home/ubuntu/nishn_workspce/test_pdfs_generic/.covid_audio_btp_private/covid_audio_btp
+cd <PROJECT_ROOT>
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt

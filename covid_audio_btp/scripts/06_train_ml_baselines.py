@@ -20,7 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-names",
         nargs="+",
-        default=["dummy_most_frequent", "dummy_stratified", "logistic_regression", "random_forest", "xgboost"],
+        default=["dummy_most_frequent", "dummy_stratified", "logistic_regression", "random_forest"],
     )
     return parser.parse_args()
 
@@ -47,11 +47,24 @@ def main() -> None:
             save_model(result.model, args.models_dir / f"{model_name}_{modality}.joblib")
             print(f"Trained {model_name} / {modality}: AUROC={result.metrics.get('auroc')}")
 
+    if not metric_rows:
+        counts = (
+            features.groupby(["modality", "label_binary", "split"], dropna=False)
+            .size()
+            .reset_index(name="n")
+            .to_string(index=False)
+            if {"modality", "label_binary", "split"}.issubset(features.columns)
+            else "feature table is missing modality/label_binary/split columns"
+        )
+        raise RuntimeError(
+            "No ML models were trained successfully. Check supervised label coverage, splits, "
+            "and feature columns. Feature counts:\n"
+            f"{counts}"
+        )
+
     pd.DataFrame(metric_rows).to_csv(args.metrics_output, index=False)
-    if validation_frames:
-        pd.concat(validation_frames, ignore_index=True).to_csv(args.validation_output, index=False)
-    if test_frames:
-        pd.concat(test_frames, ignore_index=True).to_csv(args.test_output, index=False)
+    pd.concat(validation_frames, ignore_index=True).to_csv(args.validation_output, index=False)
+    pd.concat(test_frames, ignore_index=True).to_csv(args.test_output, index=False)
     print(f"Wrote metrics: {args.metrics_output}")
 
 

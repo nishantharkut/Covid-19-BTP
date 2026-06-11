@@ -54,13 +54,26 @@ def build_metadata_feature_frame(
             base[col] = metadata[col]
     if base.empty:
         return pd.DataFrame(index=metadata.index)
-    numeric = base.apply(pd.to_numeric, errors="ignore")
-    categorical_cols = [c for c in numeric.columns if not pd.api.types.is_numeric_dtype(numeric[c])]
-    numeric_cols = [c for c in numeric.columns if c not in categorical_cols]
-    if numeric_cols:
-        frames.append(numeric[numeric_cols].fillna(0.0).astype(float))
+    numeric_parts: dict[str, pd.Series] = {}
+    categorical_cols: list[str] = []
+    for col in base.columns:
+        series = base[col]
+        if pd.api.types.is_bool_dtype(series):
+            numeric_parts[col] = series.fillna(False).astype(float)
+            continue
+        if pd.api.types.is_numeric_dtype(series):
+            numeric_parts[col] = pd.to_numeric(series, errors="coerce").fillna(0.0).astype(float)
+            continue
+        converted = pd.to_numeric(series, errors="coerce")
+        present = series.notna() & series.astype(str).str.strip().ne("")
+        if bool(present.any()) and bool(converted[present].notna().all()):
+            numeric_parts[col] = converted.fillna(0.0).astype(float)
+        else:
+            categorical_cols.append(col)
+    if numeric_parts:
+        frames.append(pd.DataFrame(numeric_parts, index=base.index))
     if categorical_cols:
-        frames.append(pd.get_dummies(numeric[categorical_cols].fillna("unknown").astype(str), dummy_na=False))
+        frames.append(pd.get_dummies(base[categorical_cols].fillna("unknown").astype(str), dummy_na=False))
     if not frames:
         return pd.DataFrame(index=metadata.index)
     return pd.concat(frames, axis=1).astype(float)

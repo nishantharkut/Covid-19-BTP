@@ -27,19 +27,19 @@ def assign_quality_flag(
     }.get(modality, config.min_speech_seconds)
 
     if duration_sec < min_duration:
-        reasons.append(f"duration<{min_duration}")
+        reasons.append("duration")
     if silence_ratio > config.max_silence_ratio:
-        reasons.append(f"silence_ratio>{config.max_silence_ratio}")
+        reasons.append("silence")
     if clipping_ratio > config.max_clipping_ratio:
-        reasons.append(f"clipping_ratio>{config.max_clipping_ratio}")
+        reasons.append("clipping")
 
     if not reasons:
         return "ok", []
-    if any(r.startswith("duration") for r in reasons):
+    if "duration" in reasons:
         return "short", reasons
-    if any(r.startswith("silence") for r in reasons):
+    if "silence" in reasons:
         return "mostly_silence", reasons
-    if any(r.startswith("clipping") for r in reasons):
+    if "clipping" in reasons:
         return "clipped", reasons
     return "low_quality", reasons
 

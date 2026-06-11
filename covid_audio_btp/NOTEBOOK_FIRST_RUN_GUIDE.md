@@ -4,7 +4,7 @@ Start with `notebooks/00_RUN_EVERYTHING_PUBLICATION.ipynb`. It is the single mai
 
 Before running locally, read `DECISION_LOCK_AND_LOCAL_RUN_PROTOCOL.md`. It records the current decisions: Coswara first, COUGHVID later, `RUN_CNN = False`, no SSL/GRL until baseline evidence exists, and datasets live on your local machine rather than this EC2 workspace.
 
--First Run Guide
+## First Run Guide
 
 This project is designed to be run from Jupyter, with reusable implementation code under `src/covid_audio_btp`.
 
@@ -19,6 +19,7 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 pip install -e .
+python scripts/00_local_preflight.py --coswara-dir data/raw/coswara
 jupyter lab
 ```
 

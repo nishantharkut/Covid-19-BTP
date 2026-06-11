@@ -1,7 +1,7 @@
 # COVID/Respiratory Audio BTP Master Project Record
 
-Last updated: 2026-05-26
-Project path: `/home/ubuntu/nishn_workspce/test_pdfs_generic/.covid_audio_btp_private/covid_audio_btp`
+Last updated: 2026-06-10
+Project path: `<PROJECT_ROOT>`
 Status: implementation scaffold complete; runtime validation pending on local environment with dependencies and datasets.
 
 ## 1. Purpose Of This Master Record
@@ -38,8 +38,22 @@ COVID Audio BTP / Q-CalFuse-style respiratory audio reliability study
 Primary goal:
 
 ```text
+Get an A-grade BTP with a working, reproducible, well-defended respiratory-audio research system.
+```
+
+Publication-track secondary goal:
+
+```text
+Build enough rigor that the work can become a tier-2 conference submission or serious journal manuscript after real results and ablations exist.
+```
+
+Technical scope:
+
+```text
 Build a non-diagnostic research prototype and experimental framework for COVID/respiratory audio screening using cough, breath, and speech audio, with quality-aware preprocessing, participant-level splits, calibrated branch predictions, cautious fusion, abstention, confounding analysis, and cross-dataset validation.
 ```
+
+The detailed grading/publication strategy is locked in `BTP_A_GRADE_AND_PUBLICATION_TARGET.md`.
 
 Required disclaimer:
 
@@ -63,7 +77,7 @@ From the chat decisions:
 - Persistent project files must stay inside the hidden folder:
 
 ```text
-/home/ubuntu/nishn_workspce/test_pdfs_generic/.covid_audio_btp_private/covid_audio_btp
+<PROJECT_ROOT>
 ```
 
 - Do not put persistent files in `/tmp` or visible root folders.
@@ -71,7 +85,7 @@ From the chat decisions:
 - Reapply private permissions after edits:
 
 ```bash
-chmod -R go-rwx /home/ubuntu/nishn_workspce/test_pdfs_generic/.covid_audio_btp_private
+chmod -R go-rwx <PRIVATE_CODEX_WORKSPACE>
 ```
 
 - Main local execution should be Jupyter-first.
@@ -520,7 +534,7 @@ A high-end paper will depend on results. The project is built to support a serio
 ## 16. Local First Run Commands
 
 ```bash
-cd /home/ubuntu/nishn_workspce/test_pdfs_generic/.covid_audio_btp_private/covid_audio_btp
+cd <PROJECT_ROOT>
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip

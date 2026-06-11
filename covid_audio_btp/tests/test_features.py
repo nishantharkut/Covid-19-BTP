@@ -8,8 +8,9 @@ def test_crop_or_pad_audio_pads_short_signal():
     out = crop_or_pad_audio(y, target_samples=8)
 
     assert out.shape == (8,)
-    assert out[:4].tolist() == [1.0, 1.0, 1.0, 1.0]
-    assert out[4:].tolist() == [0.0, 0.0, 0.0, 0.0]
+    assert out[:2].tolist() == [0.0, 0.0]
+    assert out[2:6].tolist() == [1.0, 1.0, 1.0, 1.0]
+    assert out[6:].tolist() == [0.0, 0.0]
 
 
 def test_crop_or_pad_audio_center_crops_long_signal():

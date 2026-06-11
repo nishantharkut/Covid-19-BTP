@@ -1,6 +1,6 @@
 # Local Run Exact Commands
 
-Last updated: 2026-06-03
+Last updated: 2026-06-10
 
 Use this file when running the project on your own local machine. The EC2 workspace does not contain your raw datasets.
 
@@ -149,6 +149,15 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
+`requirements.txt` is now the core first-run environment only. Do not install GPU/CNN/demo extras until the Coswara baseline passes.
+
+Optional later:
+
+```bash
+pip install -r requirements-dev.txt       # pytest only, for tests
+pip install -r requirements-optional.txt  # xgboost and streamlit
+```
+
 If `python3` is not available, try:
 
 ```bash
@@ -160,10 +169,10 @@ Approximate time:
 
 ```text
 Fast internet: 15-30 minutes
-Slow internet or PyTorch install issues: 30-60 minutes
+Slow internet or source builds: 30-60 minutes
 ```
 
-If PyTorch installation fails, stop and send the exact error.
+If dependency installation fails, stop and send the exact error.
 
 ## 6. Register Jupyter Kernel
 
@@ -177,30 +186,35 @@ python -m ipykernel install --user --name covid-audio-btp --display-name "COVID 
 
 Approximate time: less than 1 minute.
 
-## 7. Quick Environment Check
+## 7. Mandatory Fast Preflight
 
-Run:
+Run this before opening the notebook:
 
 ```bash
 cd "$PROJECT_ROOT"
 source .venv/bin/activate
-python scripts/00_check_environment.py
+python scripts/00_local_preflight.py --coswara-dir data/raw/coswara
 ```
+
+This checks notebook syntax, Python script syntax, required imports, and whether Coswara contains extracted audio files.
 
 Optional, if you have time:
 
 ```bash
+python scripts/00_check_environment.py
+pip install -r requirements-dev.txt
 pytest tests/test_labels.py tests/test_data_index.py tests/test_quality.py tests/test_validation.py -q
 ```
 
 Approximate time:
 
 ```text
+Preflight: less than 1 minute
 Environment check: less than 1 minute
 Small tests: 1-5 minutes
 ```
 
-If tests fail because of missing dependencies, send the exact output. Do not start changing random package versions.
+If preflight fails, stop and send the exact output. Do not start the full notebook until preflight passes.
 
 ## 8. Start Jupyter
 
@@ -241,7 +255,7 @@ RUN_LAYOUT_AUDIT = True
 RUN_VALIDATION = True
 RUN_CNN = False
 
-RUN_PUBLICATION_EXTRAS = True
+RUN_PUBLICATION_EXTRAS = False
 RUN_METADATA_BASELINE = True
 RUN_QUALITY_WEIGHTED_FUSION = True
 RUN_ABSTENTION = True

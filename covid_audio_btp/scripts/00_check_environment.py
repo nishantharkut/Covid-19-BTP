@@ -16,10 +16,18 @@ REQUIRED = [
     "matplotlib",
     "seaborn",
     "joblib",
-    "pytest",
+    "tqdm",
 ]
 
-OPTIONAL = ["xgboost", "torch", "torchaudio", "streamlit"]
+OPTIONAL = [
+    "xgboost",
+    "torch",
+    "torchaudio",
+    "streamlit",
+    "pytest",
+    "jupyterlab",
+    "ipykernel",
+]
 
 
 def main() -> None:
@@ -49,4 +57,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

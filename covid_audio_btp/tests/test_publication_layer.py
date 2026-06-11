@@ -229,6 +229,42 @@ def test_local_audio_path_materializes_zip_member_temporarily(tmp_path):
     assert not local_path.exists()
 
 
+
+def test_coughvid_adapter_supports_v3_metadata_inside_zip(tmp_path):
+    import zipfile
+
+    from covid_audio_btp.external_datasets import build_coughvid_index
+
+    uuid = "ghi"
+    zip_path = tmp_path / "public_dataset_v3.zip"
+    metadata = pd.DataFrame(
+        {
+            "uuid": [uuid],
+            "status_SSL": ["COVID-19"],
+            "datetime": ["2021-08-26T12:00:00+00:00"],
+            "cough_detected": [0.95],
+            "SNR": [11.2],
+            "latitude": [46.5],
+            "longitude": [6.6],
+            "age": [44],
+            "gender": ["female"],
+            "respiratory_condition": [False],
+            "fever_muscle_pain": [True],
+        }
+    )
+    with zipfile.ZipFile(zip_path, mode="w") as zf:
+        zf.writestr("metadata_compiled.csv", metadata.to_csv(index=False))
+        zf.writestr(f"public_dataset/{uuid}.ogg", b"fake audio bytes")
+
+    index = build_coughvid_index(zip_path, min_cough_detected=0.8)
+
+    assert len(index) == 1
+    assert index.loc[0, "participant_id"] == uuid
+    assert index.loc[0, "label_raw"] == "COVID-19"
+    assert index.loc[0, "label_binary"] == "positive"
+    assert index.loc[0, "audio_path"] == f"{zip_path.as_posix()}::public_dataset/{uuid}.ogg"
+    assert index.loc[0, "manual_quality_label"] == "ok"
+
 def test_coughvid_adapter_supports_v3_status_ssl_metadata(tmp_path):
     from covid_audio_btp.external_datasets import build_coughvid_index
 

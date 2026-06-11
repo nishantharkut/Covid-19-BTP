@@ -6,13 +6,7 @@ soundfile
 scikit-learn
 matplotlib
 seaborn
-torch
-torchaudio
-xgboost
 joblib
 tqdm
-pytest
 jupyterlab
 ipykernel
-streamlit
-

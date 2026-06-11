@@ -1,6 +1,6 @@
 # Advanced Extension From Gemini/ChatGPT PDF Review
 
-Last updated: 2026-06-03
+Last updated: 2026-06-10
 
 This file records the advanced ideas from the two uploaded PDFs and the later Gemini conversation. These are not first-run requirements. They are the post-baseline publication upgrade path.
 
@@ -300,6 +300,27 @@ baseline reliability pipeline + cough-only external validation + acoustic-domain
 ```
 
 This is still a defensible project.
+
+For the known lab machine with NVIDIA T1000 8 GB and 19 GB RAM:
+
+Allowed after the baseline succeeds:
+
+```text
+frozen cough-only SSL embedding extraction
+batch size 1-4
+short fixed/chunked clips
+lightweight classifiers on saved embeddings
+```
+
+Not recommended on that machine:
+
+```text
+end-to-end Wav2Vec/HuBERT fine-tuning
+large SSL encoder plus GRL training
+multi-dataset transformer training
+```
+
+This keeps the publication upgrade realistic without damaging the A-grade BTP path.
 
 ## Manuscript Framing
 
