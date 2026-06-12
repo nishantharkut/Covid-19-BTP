@@ -25,6 +25,8 @@ def test_default_artifact_paths_discovers_representation_outputs(tmp_path) -> No
 
     artifacts = module.default_artifact_paths(project_root=tmp_path)
 
+    assert tmp_path / "reports" / "tables" / "calibration_under_shift_bins.csv" in artifacts
+    assert tmp_path / "reports" / "tables" / "calibration_under_shift_summary.csv" in artifacts
     assert tmp_path / "reports" / "tables" / "clinical_operating_points.csv" in artifacts
     assert metrics_dir / "external_model_grid_beats_metrics.csv" in artifacts
     assert metrics_dir / "coughvid_internal_panns_cnn14_bootstrap_ci.csv" in artifacts

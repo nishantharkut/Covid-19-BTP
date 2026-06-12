@@ -24,6 +24,7 @@ def test_default_metric_paths_discovers_representation_outputs(tmp_path) -> None
     metric_paths = module.default_metric_paths(metrics_dir=metrics_dir)
     ci_paths = module.default_ci_paths(metrics_dir=metrics_dir)
 
+    assert Path("reports/tables/calibration_under_shift_summary.csv") in metric_paths
     assert metrics_dir / "external_model_grid_opensmile_egemaps_metrics.csv" in metric_paths
     assert metrics_dir / "coughvid_internal_beats_metrics.csv" in metric_paths
     assert metrics_dir / "coughvid_internal_beats_bootstrap_ci.csv" in ci_paths
