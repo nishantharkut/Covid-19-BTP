@@ -1,0 +1,332 @@
+{
+  "created_at_utc": "2026-06-12T21:51:58.668741+00:00",
+  "platform": "Linux-6.17.0-35-generic-x86_64-with-glibc2.39",
+  "python_executable": "/home/covid/Desktop/Covid-19-BTP/covid_audio_btp/.venv/bin/python",
+  "config": {
+    "run_name": "covid_audio_publication_run",
+    "seed": 42
+  },
+  "packages": {
+    "python": "3.12.3",
+    "numpy": "2.4.6",
+    "pandas": "3.0.3",
+    "scikit-learn": "1.9.0",
+    "librosa": "0.11.0",
+    "soundfile": "0.14.0",
+    "torch": "2.11.0+cu128",
+    "torchaudio": "2.11.0+cu128",
+    "xgboost": "3.2.0",
+    "lightgbm": "4.6.0",
+    "catboost": "1.2.10",
+    "opensmile": "2.6.0",
+    "shap": "0.52.0"
+  },
+  "artifacts": [
+    {
+      "path": "data/interim/coswara_index.csv",
+      "exists": true,
+      "size_bytes": 14467114,
+      "sha256": "215c79b8b25af27ac83a87947317039097e5152685d9cc03a6407a50059afbdd"
+    },
+    {
+      "path": "data/processed/metadata_clean.csv",
+      "exists": true,
+      "size_bytes": 15192524,
+      "sha256": "a63e24cd9c2b148084bc45d4303f48a205520eda44ea89da4319760da8eda65f"
+    },
+    {
+      "path": "data/processed/audio_quality.csv",
+      "exists": true,
+      "size_bytes": 8643031,
+      "sha256": "bdd1f2daffd13107064f41cbcf9b3fd1ebbf513340908aa28826270bf3d4f178"
+    },
+    {
+      "path": "data/processed/features_mfcc.csv",
+      "exists": true,
+      "size_bytes": 90512724,
+      "sha256": "b8e4136b0f619671a6c010b79d313227dd28de78eebcffb60f0a19bc275654f9"
+    },
+    {
+      "path": "data/outputs/metrics/ml_baseline_metrics.csv",
+      "exists": true,
+      "size_bytes": 2362,
+      "sha256": "0713be8d207e39a3f35664d745ef6b155a3511a36b17fd65161720729a4b3d71"
+    },
+    {
+      "path": "data/outputs/metrics/calibration_metrics.csv",
+      "exists": true,
+      "size_bytes": 2268,
+      "sha256": "52ec8c410a4bf069e0e5f3707e788aba29d0948651b71047fcda25af384e558e"
+    },
+    {
+      "path": "data/outputs/metrics/fusion_metrics.csv",
+      "exists": true,
+      "size_bytes": 538,
+      "sha256": "014a1ab92df9bf02ecd8a421a8c38fd04d37c1ee15c66518c420adbb6f1ad885"
+    },
+    {
+      "path": "data/outputs/metrics/quality_weighted_fusion_metrics.csv",
+      "exists": true,
+      "size_bytes": 326,
+      "sha256": "d8e7a46da2595243909bf4d4fdc04ffc49b49e0f36d476664a84f3eafee28484"
+    },
+    {
+      "path": "data/outputs/metrics/cross_dataset_metrics.csv",
+      "exists": true,
+      "size_bytes": 374,
+      "sha256": "3e913b713cdbd25fe25b8b1a1a9530dfad9b5561475c8d4b7059465977173620"
+    },
+    {
+      "path": "data/outputs/metrics/external_model_grid_metrics.csv",
+      "exists": true,
+      "size_bytes": 6598,
+      "sha256": "9a5d0737a25aa5e779ca3b59a083d16c916d663e7a0d5b04fc229c3f44944403"
+    },
+    {
+      "path": "data/outputs/metrics/external_model_grid_bootstrap_ci.csv",
+      "exists": true,
+      "size_bytes": 12470,
+      "sha256": "bfeff2b8b98ba573a0a9b7b2b0eb2e310fb0820a0659073360f7072201f31c4e"
+    },
+    {
+      "path": "data/outputs/metrics/coughvid_internal_metrics.csv",
+      "exists": true,
+      "size_bytes": 1499,
+      "sha256": "482daf2aad7ec28eb53c5e711e6cfbc6529341112fbfff8f08446a2de14db678"
+    },
+    {
+      "path": "data/outputs/metrics/coughvid_internal_bootstrap_ci.csv",
+      "exists": true,
+      "size_bytes": 2332,
+      "sha256": "4fc2a2ea21440033fa08e2bd0b92bf95aeb36cabd7e2c7f82c9f0bf8c2e54060"
+    },
+    {
+      "path": "data/outputs/metrics/metadata_confounding_metrics.csv",
+      "exists": true,
+      "size_bytes": 1283,
+      "sha256": "25680573f35defa05244fe56c19832c122ad180281d78d51a3df4bb8573bdf99"
+    },
+    {
+      "path": "data/outputs/metrics/metadata_confounding_predictions.csv",
+      "exists": true,
+      "size_bytes": 1608943,
+      "sha256": "4fd931cb6e7ad3425bedba53025eb687068a925eadc8f213d5fd9e2d0a8883f3"
+    },
+    {
+      "path": "reports/tables/metadata_confounding_feature_importance.csv",
+      "exists": true,
+      "size_bytes": 12951,
+      "sha256": "73c6ed62d2462d8cfa713f4f48e02e3b3fe381d9118932f2ddeff2c1514e3a9a"
+    },
+    {
+      "path": "reports/tables/metadata_confounding_group_summary.csv",
+      "exists": true,
+      "size_bytes": 1359,
+      "sha256": "9f0e17046f69f88e9bf241b2ce8803a842c1b245ad85c96d90ddb3db66af2520"
+    },
+    {
+      "path": "data/outputs/metrics/confounding_controlled_audio_metrics.csv",
+      "exists": true,
+      "size_bytes": 640,
+      "sha256": "4127a2632fddaf81d94d6f4d645f7b851a8dbacad1a3f0dda018176f356f56a2"
+    },
+    {
+      "path": "data/outputs/metrics/confounding_controlled_audio_weights.csv",
+      "exists": true,
+      "size_bytes": 24052,
+      "sha256": "56c9772fcd9c821bf5d7e7ceac3ca8bc2a9ba0aec102ce0d83c88d700e3056a4"
+    },
+    {
+      "path": "data/outputs/metrics/confounding_controlled_audio_bootstrap_ci.csv",
+      "exists": true,
+      "size_bytes": 1911,
+      "sha256": "184d4fdd991aa585a5a463256bfb6f1697a28ac61a1207461377effb80e6c240"
+    },
+    {
+      "path": "reports/tables/confounding_controlled_balance.csv",
+      "exists": true,
+      "size_bytes": 3303,
+      "sha256": "8912e40d660f1293e789e2ce4018686470554d391f5a49ea1cc468f2ef1c0164"
+    },
+    {
+      "path": "reports/tables/calibration_under_shift_bins.csv",
+      "exists": true,
+      "size_bytes": 130999,
+      "sha256": "3bf39bdbdab0584b21b1e48f340f4ff8b07c8b84aab83e44a2f5d5e585add9f7"
+    },
+    {
+      "path": "reports/tables/calibration_under_shift_summary.csv",
+      "exists": true,
+      "size_bytes": 26873,
+      "sha256": "14c0f53d4927e1bf73fbcd2442eb211ed9efd736727b1dc49a54c4886c685606"
+    },
+    {
+      "path": "reports/tables/clinical_operating_points.csv",
+      "exists": true,
+      "size_bytes": 157026,
+      "sha256": "f7be0f91c5aa0f67a62b687432f36ec89602d020c69595de7f525a2397f7e825"
+    },
+    {
+      "path": "reports/tables/publication_evidence_matrix.csv",
+      "exists": true,
+      "size_bytes": 9745,
+      "sha256": "3c594e89666a25e1fcd1ba03684bbd4bd6019993355b01f4b8002d0b77eb47ae"
+    },
+    {
+      "path": "reports/tables/publication_evidence_matrix.md",
+      "exists": true,
+      "size_bytes": 10064,
+      "sha256": "7d8ced59d0523aec987fbcf6f4fe64b8e8ce7c63fb04fc4a836bb0d39889556d"
+    },
+    {
+      "path": "reports/tables/related_paper_comparison.csv",
+      "exists": true,
+      "size_bytes": 12568,
+      "sha256": "4fd700b0a9e6055f20152d542eb1e34f1e1ddc5f39cf6fe7dec14962cb712659"
+    },
+    {
+      "path": "reports/tables/related_paper_comparison.md",
+      "exists": true,
+      "size_bytes": 13207,
+      "sha256": "1d88ba28b08fdec32dfd3855b1bcab3e5b81dfa23ab9b14d35088d42d8b161d9"
+    },
+    {
+      "path": "reports/final/BTP_PUBLICATION_RESULTS_REPORT.md",
+      "exists": true,
+      "size_bytes": 25308,
+      "sha256": "7d8f48e2487e39150154743ea95a92eaee61a26c9a63b223f2d4885cb35b99f5"
+    },
+    {
+      "path": "reports/final/BTP_PUBLICATION_RESULTS_SUMMARY.md",
+      "exists": true,
+      "size_bytes": 560,
+      "sha256": "915c408e3fb73b4eb86e8be9ce7bc28ef1dd7b9ed79261f4c13b523d8dc8a10b"
+    },
+    {
+      "path": "reports/tables/feature_shift_report.csv",
+      "exists": true,
+      "size_bytes": 42022,
+      "sha256": "283c0fe329845b114e421593d82ddfe05323bd3bca4c47d78e09e9aa0e164b58"
+    },
+    {
+      "path": "reports/tables/feature_shift_summary.csv",
+      "exists": true,
+      "size_bytes": 113,
+      "sha256": "6aa075b4b0006d04afa708f0e28b3965b8ac1cd24edc91dbea30a3606273a74b"
+    },
+    {
+      "path": "reports/tables/paper_metric_table.csv",
+      "exists": true,
+      "size_bytes": 35387,
+      "sha256": "9122bcc2a64de7ce0681f6bccb31aaf5bc60d50d9c55b6f1da08a860cb6eed00"
+    },
+    {
+      "path": "data/outputs/metrics/external_model_grid_beats_metrics.csv",
+      "exists": true,
+      "size_bytes": 6575,
+      "sha256": "6f142b1c381132fc742238e03f5cf666cc49e8594cf673c319e66307162a1b62"
+    },
+    {
+      "path": "data/outputs/metrics/external_model_grid_opensmile_egemaps_metrics.csv",
+      "exists": true,
+      "size_bytes": 6589,
+      "sha256": "6debb6ddbc31e0523df289cebdccf950b929136ed02e3024368a9fb3bfee2e37"
+    },
+    {
+      "path": "data/outputs/metrics/external_model_grid_panns_metrics.csv",
+      "exists": true,
+      "size_bytes": 2741,
+      "sha256": "568b45711b0f623a902374c60bcb5d469d0864d6de10c37b13d2bfbbf633c25d"
+    },
+    {
+      "path": "data/outputs/metrics/external_model_grid_beats_bootstrap_ci.csv",
+      "exists": true,
+      "size_bytes": 12471,
+      "sha256": "1cc57059234ecf11bbfaa5b8c6ff523925473c35971b0d105bf23137c17ecf7e"
+    },
+    {
+      "path": "data/outputs/metrics/external_model_grid_opensmile_egemaps_bootstrap_ci.csv",
+      "exists": true,
+      "size_bytes": 12472,
+      "sha256": "be5d281b15ce2342f0b812e1a12d750e19e5d7ef79e734db6231b08c4491b878"
+    },
+    {
+      "path": "data/outputs/metrics/external_model_grid_panns_bootstrap_ci.csv",
+      "exists": true,
+      "size_bytes": 4937,
+      "sha256": "6c5c52d39b55541bfdc13aed40141eb64c3e2fa43d54f0104034b554b89db622"
+    },
+    {
+      "path": "data/outputs/metrics/coughvid_internal_beats_metrics.csv",
+      "exists": true,
+      "size_bytes": 1503,
+      "sha256": "b1797ced761d474e65dbd02cf42f00601e69e06e283cd93c5be2a481a86b8c03"
+    },
+    {
+      "path": "data/outputs/metrics/coughvid_internal_opensmile_egemaps_metrics.csv",
+      "exists": true,
+      "size_bytes": 1500,
+      "sha256": "99ec44f5259e93a3bdc387ea539da5547a0c6866a6f09b24350a90ca475407be"
+    },
+    {
+      "path": "data/outputs/metrics/coughvid_internal_panns_metrics.csv",
+      "exists": true,
+      "size_bytes": 1510,
+      "sha256": "2dc6fc24e93d5c2d9654865cba870efce10ad46a8cef52ec4957905baf165da7"
+    },
+    {
+      "path": "data/outputs/metrics/coughvid_internal_beats_bootstrap_ci.csv",
+      "exists": true,
+      "size_bytes": 2336,
+      "sha256": "8469cd20e794cacc871696baaf386493e9c355abe8f23fcf9f35300f4acbc308"
+    },
+    {
+      "path": "data/outputs/metrics/coughvid_internal_opensmile_egemaps_bootstrap_ci.csv",
+      "exists": true,
+      "size_bytes": 2338,
+      "sha256": "aa4fabac4102811b2ad7483413843fc0e1aa94875105da75cd44a3f5ed083c54"
+    },
+    {
+      "path": "data/outputs/metrics/coughvid_internal_panns_bootstrap_ci.csv",
+      "exists": true,
+      "size_bytes": 2352,
+      "sha256": "e0a5ea59cf77df00df26ff046bb9d7c0dfcf8ae609cc23a89d521ac883b93c79"
+    },
+    {
+      "path": "reports/tables/feature_shift_beats_cough.csv",
+      "exists": true,
+      "size_bytes": 134838,
+      "sha256": "55476521e8f4dd50fa995907e869a5ec96f88ac90ef15f381c36350d74068428"
+    },
+    {
+      "path": "reports/tables/feature_shift_opensmile_egemaps_cough.csv",
+      "exists": true,
+      "size_bytes": 17859,
+      "sha256": "d3e4275eee8cf7cff54353bb1145f251ee74be9db54b025379802633bc7a07e4"
+    },
+    {
+      "path": "reports/tables/feature_shift_panns_cough.csv",
+      "exists": true,
+      "size_bytes": 303345,
+      "sha256": "83f93de5367cfb07553c5de13114496057740bf8005a10c2b65fcaeb8be07e01"
+    },
+    {
+      "path": "reports/tables/feature_shift_beats_summary.csv",
+      "exists": true,
+      "size_bytes": 113,
+      "sha256": "ca9a3662f6e614f54376a9e5a4436ae3f64c47acaa2d6e565493893406cb1389"
+    },
+    {
+      "path": "reports/tables/feature_shift_opensmile_egemaps_summary.csv",
+      "exists": true,
+      "size_bytes": 111,
+      "sha256": "b2ea21d6c866db82ecbaed42e1c6bc7419281a6e27fe1491614ca389e19a8346"
+    },
+    {
+      "path": "reports/tables/feature_shift_panns_summary.csv",
+      "exists": true,
+      "size_bytes": 114,
+      "sha256": "b5831df492ca83705c98b0988ed129271518785b2a046eeebde067cc8b278b3c"
+    }
+  ]
+}
