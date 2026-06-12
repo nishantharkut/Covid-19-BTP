@@ -110,9 +110,11 @@ class PannsCnn14OfficialExtractor:
 
         self.torch = torch
         self.device = resolve_torch_device(device)
-        source = str(Path(source_dir).resolve())
-        if source not in sys.path:
-            sys.path.insert(0, source)
+        source_path = Path(source_dir).resolve()
+        for source in (source_path, source_path / "pytorch"):
+            source_text = str(source)
+            if source_text not in sys.path:
+                sys.path.insert(0, source_text)
         from pytorch.models import Cnn14
 
         model = Cnn14(
