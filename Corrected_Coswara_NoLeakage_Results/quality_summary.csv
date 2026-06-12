@@ -1,0 +1,5 @@
+quality_flag,n_recordings,median_duration_sec,median_silence_ratio,median_clipping_ratio
+ok,23539,8.789375,0.10616587822754198,0.0
+mostly_silence,597,7.68,0.8020833333333334,0.0
+corrupt,390,0.0,1.0,0.0
+short,186,0.597375,0.0,0.0

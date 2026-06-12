@@ -1,0 +1,82 @@
+{
+  "created_at_utc": "2026-06-12T08:52:18.142622+00:00",
+  "platform": "Linux-6.17.0-35-generic-x86_64-with-glibc2.39",
+  "python_executable": "/home/covid/Desktop/Covid-19-BTP/covid_audio_btp/.venv/bin/python",
+  "config": {
+    "run_name": "covid_audio_publication_run",
+    "seed": 42
+  },
+  "packages": {
+    "python": "3.12.3",
+    "numpy": "2.4.6",
+    "pandas": "3.0.3",
+    "scikit-learn": "1.9.0",
+    "librosa": "0.11.0",
+    "soundfile": "0.14.0",
+    "torch": "2.11.0+cu128",
+    "torchaudio": "2.11.0+cu128",
+    "xgboost": "unavailable"
+  },
+  "artifacts": [
+    {
+      "path": "data/interim/coswara_index.csv",
+      "exists": true,
+      "size_bytes": 14467114,
+      "sha256": "215c79b8b25af27ac83a87947317039097e5152685d9cc03a6407a50059afbdd"
+    },
+    {
+      "path": "data/processed/metadata_clean.csv",
+      "exists": true,
+      "size_bytes": 15192524,
+      "sha256": "a63e24cd9c2b148084bc45d4303f48a205520eda44ea89da4319760da8eda65f"
+    },
+    {
+      "path": "data/processed/audio_quality.csv",
+      "exists": true,
+      "size_bytes": 8643031,
+      "sha256": "bdd1f2daffd13107064f41cbcf9b3fd1ebbf513340908aa28826270bf3d4f178"
+    },
+    {
+      "path": "data/processed/features_mfcc.csv",
+      "exists": true,
+      "size_bytes": 90512724,
+      "sha256": "b8e4136b0f619671a6c010b79d313227dd28de78eebcffb60f0a19bc275654f9"
+    },
+    {
+      "path": "data/outputs/metrics/ml_baseline_metrics.csv",
+      "exists": true,
+      "size_bytes": 2362,
+      "sha256": "0713be8d207e39a3f35664d745ef6b155a3511a36b17fd65161720729a4b3d71"
+    },
+    {
+      "path": "data/outputs/metrics/calibration_metrics.csv",
+      "exists": true,
+      "size_bytes": 2268,
+      "sha256": "52ec8c410a4bf069e0e5f3707e788aba29d0948651b71047fcda25af384e558e"
+    },
+    {
+      "path": "data/outputs/metrics/fusion_metrics.csv",
+      "exists": true,
+      "size_bytes": 538,
+      "sha256": "014a1ab92df9bf02ecd8a421a8c38fd04d37c1ee15c66518c420adbb6f1ad885"
+    },
+    {
+      "path": "data/outputs/metrics/quality_weighted_fusion_metrics.csv",
+      "exists": true,
+      "size_bytes": 326,
+      "sha256": "d8e7a46da2595243909bf4d4fdc04ffc49b49e0f36d476664a84f3eafee28484"
+    },
+    {
+      "path": "data/outputs/metrics/cross_dataset_metrics.csv",
+      "exists": false,
+      "size_bytes": 0,
+      "sha256": ""
+    },
+    {
+      "path": "reports/tables/paper_metric_table.csv",
+      "exists": true,
+      "size_bytes": 3203,
+      "sha256": "8c13fcb27ac07974021fba0e75e328e5baeb15598c996576067a588da6c3e17e"
+    }
+  ]
+}

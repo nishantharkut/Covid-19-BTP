@@ -1,0 +1,10 @@
+dataset,modality,label_binary,n_recordings,n_participants
+coswara,breath,negative,2866,1433
+coswara,breath,positive,1362,681
+coswara,breath,unknown,1264,632
+coswara,cough,negative,2865,1433
+coswara,cough,positive,1362,681
+coswara,cough,unknown,1264,632
+coswara,speech,negative,7164,1433
+coswara,speech,positive,3405,681
+coswara,speech,unknown,3160,632
