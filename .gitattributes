@@ -1,0 +1,5 @@
+Representation_Results_*.zip filter=lfs diff=lfs merge=lfs -text
+Representation_Results_*/processed/*.csv filter=lfs diff=lfs merge=lfs -text
+Representation_Results_*/metrics/*.csv filter=lfs diff=lfs merge=lfs -text
+Representation_Results_*/tables/*.csv filter=lfs diff=lfs merge=lfs -text
+Representation_Results_*/reports/*.json filter=lfs diff=lfs merge=lfs -text
