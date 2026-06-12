@@ -35,6 +35,8 @@ DEFAULT_ARTIFACTS = [
     Path("reports/tables/clinical_operating_points.csv"),
     Path("reports/tables/publication_evidence_matrix.csv"),
     Path("reports/tables/publication_evidence_matrix.md"),
+    Path("reports/final/BTP_PUBLICATION_RESULTS_REPORT.md"),
+    Path("reports/final/BTP_PUBLICATION_RESULTS_SUMMARY.md"),
     Path("reports/tables/feature_shift_report.csv"),
     Path("reports/tables/feature_shift_summary.csv"),
     Path("reports/tables/paper_metric_table.csv"),

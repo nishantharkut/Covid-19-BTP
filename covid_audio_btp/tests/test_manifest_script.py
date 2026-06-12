@@ -30,6 +30,8 @@ def test_default_artifact_paths_discovers_representation_outputs(tmp_path) -> No
     assert tmp_path / "reports" / "tables" / "clinical_operating_points.csv" in artifacts
     assert tmp_path / "reports" / "tables" / "publication_evidence_matrix.csv" in artifacts
     assert tmp_path / "reports" / "tables" / "publication_evidence_matrix.md" in artifacts
+    assert tmp_path / "reports" / "final" / "BTP_PUBLICATION_RESULTS_REPORT.md" in artifacts
+    assert tmp_path / "reports" / "final" / "BTP_PUBLICATION_RESULTS_SUMMARY.md" in artifacts
     assert metrics_dir / "external_model_grid_beats_metrics.csv" in artifacts
     assert metrics_dir / "coughvid_internal_panns_cnn14_bootstrap_ci.csv" in artifacts
     assert tables_dir / "feature_shift_beats_cough.csv" in artifacts
