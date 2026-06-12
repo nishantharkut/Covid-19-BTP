@@ -28,6 +28,7 @@ DEFAULT_CI_PATHS = [
     Path("data/outputs/metrics/cross_dataset_bootstrap_ci.csv"),
     Path("data/outputs/metrics/external_model_grid_bootstrap_ci.csv"),
     Path("data/outputs/metrics/coughvid_internal_bootstrap_ci.csv"),
+    Path("data/outputs/metrics/confounding_controlled_audio_bootstrap_ci.csv"),
 ]
 
 

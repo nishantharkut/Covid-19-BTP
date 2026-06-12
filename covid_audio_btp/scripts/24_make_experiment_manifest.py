@@ -28,6 +28,7 @@ DEFAULT_ARTIFACTS = [
     Path("reports/tables/metadata_confounding_group_summary.csv"),
     Path("data/outputs/metrics/confounding_controlled_audio_metrics.csv"),
     Path("data/outputs/metrics/confounding_controlled_audio_weights.csv"),
+    Path("data/outputs/metrics/confounding_controlled_audio_bootstrap_ci.csv"),
     Path("reports/tables/confounding_controlled_balance.csv"),
     Path("reports/tables/feature_shift_report.csv"),
     Path("reports/tables/feature_shift_summary.csv"),

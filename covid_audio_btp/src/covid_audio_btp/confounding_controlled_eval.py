@@ -338,6 +338,118 @@ def weighted_binary_metric_bundle(
     return metrics
 
 
+
+def _safe_metric_from_bundle(bundle: dict[str, float], metric: str) -> float:
+    value = bundle.get(metric, float("nan"))
+    try:
+        return float(value)
+    except Exception:
+        return float("nan")
+
+
+def _bootstrap_metric_values(
+    group: pd.DataFrame,
+    metric: str,
+    control_method: str,
+    n_bootstraps: int,
+    threshold: float,
+    rng: np.random.Generator,
+) -> list[float]:
+    values: list[float] = []
+    n = len(group)
+    if n == 0:
+        return values
+    for _ in range(n_bootstraps):
+        sample = group.iloc[rng.integers(0, n, size=n)]
+        weights = sample["ipw_weight"] if control_method == "ipw_label_propensity" else None
+        bundle = weighted_binary_metric_bundle(
+            sample["label_binary"],
+            sample["probability"],
+            weights=weights,
+            threshold=threshold,
+        )
+        value = _safe_metric_from_bundle(bundle, metric)
+        if np.isfinite(value):
+            values.append(value)
+    return values
+
+
+def bootstrap_confounding_controlled_metrics(
+    predictions: pd.DataFrame,
+    metadata: pd.DataFrame,
+    covariates: list[str] | None = None,
+    group_columns: list[str] | None = None,
+    metrics: list[str] | None = None,
+    split: str | None = "test",
+    threshold: float = 0.5,
+    n_bootstraps: int = 1000,
+    confidence: float = 0.95,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Bootstrap CIs for unweighted and IPW-controlled prediction metrics.
+
+    Propensity weights are estimated once on the full evaluated split, then held
+    fixed inside the nonparametric bootstrap. This keeps the procedure fast and
+    makes the interval conditional on the fitted weighting model.
+    """
+    metrics = metrics or ["auroc", "auprc", "balanced_accuracy", "f1", "brier", "ece"]
+    result = evaluate_confounding_controlled_predictions(
+        predictions,
+        metadata,
+        covariates=covariates,
+        group_columns=group_columns,
+        split=split,
+        threshold=threshold,
+        random_state=random_state,
+    )
+    group_columns = [col for col in (group_columns or []) if col in result.merged_predictions.columns]
+    rng = np.random.default_rng(random_state)
+    alpha = (1.0 - confidence) / 2.0
+    rows: list[dict[str, object]] = []
+    for group_values, group in _iter_groups(result.merged_predictions, group_columns):
+        for control_method in ["unweighted", "ipw_label_propensity"]:
+            weights = group["ipw_weight"] if control_method == "ipw_label_propensity" else None
+            point_bundle = weighted_binary_metric_bundle(
+                group["label_binary"],
+                group["probability"],
+                weights=weights,
+                threshold=threshold,
+            )
+            for metric in metrics:
+                values = np.asarray(
+                    _bootstrap_metric_values(
+                        group,
+                        metric=metric,
+                        control_method=control_method,
+                        n_bootstraps=n_bootstraps,
+                        threshold=threshold,
+                        rng=rng,
+                    ),
+                    dtype=float,
+                )
+                point = _safe_metric_from_bundle(point_bundle, metric)
+                if values.size:
+                    ci_low, ci_high = np.quantile(values, [alpha, 1.0 - alpha])
+                    mean = float(np.mean(values))
+                else:
+                    ci_low = ci_high = mean = float("nan")
+                row: dict[str, object] = {
+                    "metric": metric,
+                    "point": point,
+                    "mean": mean,
+                    "ci_low": float(ci_low),
+                    "ci_high": float(ci_high),
+                    "confidence": float(confidence),
+                    "n_bootstraps": int(n_bootstraps),
+                    "n_samples": int(len(group)),
+                    "effective_sample_size": float(point_bundle["effective_sample_size"]),
+                    "control_method": control_method,
+                }
+                row.update(group_values)
+                rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def _iter_groups(frame: pd.DataFrame, group_columns: list[str]):
     if not group_columns:
         yield {}, frame
