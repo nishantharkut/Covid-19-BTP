@@ -275,9 +275,14 @@ def evaluate_source_to_external(
         shift_report=shift_report,
         smd_threshold=smd_threshold,
     )
-    x_train = train[cols].fillna(0.0)
-    x_validation = validation[cols].fillna(0.0)
-    x_external = external[cols].fillna(0.0)
+    x_train = train[cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    train_varying_cols = [col for col in cols if x_train[col].nunique(dropna=False) > 1]
+    if not train_varying_cols:
+        raise ValueError(f"Feature strategy {feature_strategy} selected no train-varying columns")
+    cols = train_varying_cols
+    x_train = x_train[cols]
+    x_validation = validation[cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    x_external = external[cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     model = make_rescue_model(model_name, train["label_binary"], random_state=random_state)
     model.fit(x_train, labels_to_binary(train["label_binary"]))
 
