@@ -1,0 +1,27 @@
+﻿{
+  "experiment_name": "dndt_dndf_benchmark",
+  "modalities": ["cough", "speech", "breath"],
+  "feature_sets": ["opensmile_compare_is10", "beats", "panns"],
+  "feature_reduction": {
+    "method": "select_k_best",
+    "k_dndt": 8,
+    "k_dndf": 32
+  },
+  "dndt": {
+    "num_cutpoints": 1,
+    "temperature": 1.0,
+    "lr": 0.01,
+    "epochs": 60
+  },
+  "dndf": {
+    "num_trees": 12,
+    "depth": 4,
+    "lr": 0.003,
+    "epochs": 80
+  },
+  "validation": {
+    "n_splits": 5,
+    "bootstrap_rounds": 1000,
+    "leakage_safe": true
+  }
+}
