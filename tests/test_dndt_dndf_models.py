@@ -233,8 +233,164 @@ def test_batch_normalization_matches_released_keras_defaults() -> None:
     )
 
     assert classifier.normalization.eps == pytest.approx(0.001)
-    # Keras momentum weights the old statistic. PyTorch momentum weights the new one.
-    assert classifier.normalization.momentum == pytest.approx(1.0 - 0.99)
+    assert classifier.normalization.momentum == pytest.approx(0.99)
+
+
+def _keras_batch_normalization_step(
+    features: torch.Tensor,
+    running_mean: torch.Tensor,
+    running_var: torch.Tensor,
+    *,
+    gamma: torch.Tensor,
+    beta: torch.Tensor,
+    momentum: float = 0.99,
+    eps: float = 0.001,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_mean = features.mean(dim=0)
+    batch_var = ((features - batch_mean) ** 2).mean(dim=0)
+    normalized = (features - batch_mean) / torch.sqrt(batch_var + eps)
+    normalized = normalized * gamma + beta
+    next_mean = momentum * running_mean + (1.0 - momentum) * batch_mean
+    next_var = momentum * running_var + (1.0 - momentum) * batch_var
+    return normalized, next_mean, next_var
+
+
+def test_batch_normalization_matches_exact_keras_training_and_eval_equations() -> None:
+    config = ModelConfig("dndt", 1, 2, 1.0)
+    classifier = NeuralDecisionClassifier(
+        num_features=2, model_config=config, seed=11
+    )
+    normalization = classifier.normalization
+    first_batch = torch.tensor([[1.0, 2.0], [3.0, 6.0]])
+    second_batch = torch.tensor([[2.0, 8.0], [6.0, 12.0]])
+    initial_mean = torch.zeros(2)
+    initial_var = torch.ones(2)
+    gamma = torch.tensor([1.5, 0.5])
+    beta = torch.tensor([-0.25, 0.75])
+    with torch.no_grad():
+        normalization.gamma.copy_(gamma)
+        normalization.beta.copy_(beta)
+
+    expected_first, mean_after_first, var_after_first = (
+        _keras_batch_normalization_step(
+            first_batch,
+            initial_mean,
+            initial_var,
+            gamma=gamma,
+            beta=beta,
+        )
+    )
+    normalization.train()
+    actual_first = normalization(first_batch)
+    torch.testing.assert_close(actual_first, expected_first, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        normalization.running_mean, mean_after_first, atol=1e-7, rtol=1e-7
+    )
+    torch.testing.assert_close(
+        normalization.running_var, var_after_first, atol=1e-7, rtol=1e-7
+    )
+
+    expected_second, mean_after_second, var_after_second = (
+        _keras_batch_normalization_step(
+            second_batch,
+            mean_after_first,
+            var_after_first,
+            gamma=gamma,
+            beta=beta,
+        )
+    )
+    actual_second = normalization(second_batch)
+    torch.testing.assert_close(actual_second, expected_second, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        normalization.running_mean, mean_after_second, atol=1e-7, rtol=1e-7
+    )
+    torch.testing.assert_close(
+        normalization.running_var, var_after_second, atol=1e-7, rtol=1e-7
+    )
+
+    restored = NeuralDecisionClassifier(
+        num_features=2, model_config=config, seed=99
+    )
+    restored.load_state_dict(classifier.state_dict())
+    restored.eval()
+    evaluation_batch = torch.tensor([[4.0, 10.0], [8.0, 18.0]])
+    expected_eval = (
+        (evaluation_batch - mean_after_second)
+        / torch.sqrt(var_after_second + 0.001)
+        * gamma
+        + beta
+    )
+
+    torch.testing.assert_close(
+        restored.normalization(evaluation_batch),
+        expected_eval,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    torch.testing.assert_close(restored.normalization.running_mean, mean_after_second)
+    torch.testing.assert_close(restored.normalization.running_var, var_after_second)
+
+
+def test_batch_normalization_has_trainable_gamma_and_beta() -> None:
+    classifier = NeuralDecisionClassifier(
+        num_features=3,
+        model_config=ModelConfig("dndt", 1, 2, 1.0),
+        seed=11,
+    )
+
+    parameters = dict(classifier.normalization.named_parameters())
+    assert set(parameters) == {"gamma", "beta"}
+    assert parameters["gamma"].requires_grad
+    assert parameters["beta"].requires_grad
+
+
+def test_batch_normalization_rejects_inappropriate_feature_dimensions() -> None:
+    normalization = NeuralDecisionClassifier(
+        num_features=2,
+        model_config=ModelConfig("dndt", 1, 2, 1.0),
+        seed=11,
+    ).normalization
+
+    with pytest.raises(ValueError, match="two-dimensional"):
+        normalization(torch.randn(2))
+    with pytest.raises(ValueError, match="expected 2 features"):
+        normalization(torch.randn(3, 4))
+
+
+def test_batch_normalization_allows_a_deterministic_single_sample_batch() -> None:
+    normalization = NeuralDecisionClassifier(
+        num_features=2,
+        model_config=ModelConfig("dndt", 1, 2, 1.0),
+        seed=11,
+    ).normalization
+    normalization.train()
+
+    output = normalization(torch.tensor([[2.0, -4.0]]))
+
+    torch.testing.assert_close(output, torch.zeros_like(output))
+    torch.testing.assert_close(
+        normalization.running_mean, torch.tensor([0.02, -0.04])
+    )
+    torch.testing.assert_close(normalization.running_var, torch.tensor([0.99, 0.99]))
+
+
+def test_batch_normalization_preserves_float64_and_autograd() -> None:
+    normalization = NeuralDecisionClassifier(
+        num_features=2,
+        model_config=ModelConfig("dndt", 1, 2, 1.0),
+        seed=11,
+    ).normalization.to(dtype=torch.float64)
+    features = torch.tensor(
+        [[1.0, 2.0], [3.0, 8.0]], dtype=torch.float64, requires_grad=True
+    )
+
+    output = normalization(features)
+    output.square().sum().backward()
+
+    assert output.dtype == torch.float64
+    assert features.grad is not None and torch.isfinite(features.grad).all()
+    assert normalization.gamma.grad is not None
+    assert normalization.beta.grad is not None
 
 
 def test_probabilities_and_nll_gradients_are_finite() -> None:

@@ -191,6 +191,62 @@ class NeuralDecisionForest(nn.Module):
         return torch.stack([tree(features) for tree in self.trees], dim=0).mean(dim=0)
 
 
+class KerasBatchNorm1d(nn.Module):
+    def __init__(
+        self,
+        num_features: int,
+        *,
+        eps: float = 0.001,
+        momentum: float = 0.99,
+    ) -> None:
+        super().__init__()
+        _require_positive_integer("num_features", num_features)
+        if not 0.0 < float(eps):
+            raise ValueError("eps must be positive")
+        if not 0.0 <= float(momentum) <= 1.0:
+            raise ValueError("momentum must be in [0, 1]")
+        self.num_features = num_features
+        self.eps = float(eps)
+        self.momentum = float(momentum)
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        self.register_buffer("running_mean", torch.zeros(num_features))
+        self.register_buffer("running_var", torch.ones(num_features))
+
+    @property
+    def weight(self) -> nn.Parameter:
+        return self.gamma
+
+    @property
+    def bias(self) -> nn.Parameter:
+        return self.beta
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        _validate_features(features, self.num_features)
+        if not features.is_floating_point():
+            raise ValueError("features must use a floating-point dtype")
+
+        if self.training:
+            mean = features.mean(dim=0)
+            centered = features - mean
+            variance = centered.square().mean(dim=0)
+            with torch.no_grad():
+                new_weight = 1.0 - self.momentum
+                self.running_mean.mul_(self.momentum).add_(
+                    mean.detach(), alpha=new_weight
+                )
+                self.running_var.mul_(self.momentum).add_(
+                    variance.detach(), alpha=new_weight
+                )
+        else:
+            mean = self.running_mean
+            variance = self.running_var
+            centered = features - mean
+
+        normalized = centered * torch.rsqrt(variance + self.eps)
+        return normalized * self.gamma + self.beta
+
+
 class NeuralDecisionClassifier(nn.Module):
     def __init__(
         self, *, num_features: int, model_config: ModelConfig, seed: int
@@ -200,9 +256,7 @@ class NeuralDecisionClassifier(nn.Module):
         if not isinstance(model_config, ModelConfig):
             raise ValueError("model_config must be a ModelConfig instance")
         self.num_features = num_features
-        self.normalization = nn.BatchNorm1d(
-            num_features, eps=0.001, momentum=0.01
-        )
+        self.normalization = KerasBatchNorm1d(num_features)
         if model_config.model_name == "dndt":
             self.model: nn.Module = NeuralDecisionTree(
                 num_features=num_features,
@@ -243,6 +297,7 @@ def estimate_parameter_count(
 
 
 __all__ = [
+    "KerasBatchNorm1d",
     "ModelConfig",
     "NeuralDecisionClassifier",
     "NeuralDecisionForest",
