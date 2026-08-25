@@ -31,6 +31,7 @@ _CHECKPOINT_ROLES: dict[str, str] = {
     "latest_recovery": "recovery",
     "best_inference": "inference",
 }
+_MAX_DEFERRED_CLEANUP_FILENAMES = 32
 SMOTE_K_NEIGHBORS = 5
 SVMSMOTE_K_NEIGHBORS = 5
 SVMSMOTE_M_NEIGHBORS = 10
@@ -115,6 +116,7 @@ class ResolvedCheckpoint:
     descriptor: dict[str, object]
     payload: dict[str, object]
     used_fallback: bool
+    deferred_cleanup: tuple[str, ...] = ()
 
 
 class PlannedInterruption(RuntimeError):
@@ -558,7 +560,7 @@ def _cleanup_checkpoint_generations(
     *,
     role: CheckpointRole,
     retained: tuple[dict[str, object] | None, ...],
-) -> None:
+) -> tuple[str, ...]:
     keep = {
         str(descriptor["filename"])
         for descriptor in retained
@@ -567,9 +569,15 @@ def _cleanup_checkpoint_generations(
     pattern = re.compile(
         rf"^{re.escape(role)}-g\d+-e\d+-[0-9a-f]{{64}}\.pt$"
     )
-    for path in directory.glob(f"{role}-g*-e*-*.pt"):
+    deferred: list[str] = []
+    for path in sorted(directory.glob(f"{role}-g*-e*-*.pt")):
         if pattern.fullmatch(path.name) and path.name not in keep:
-            path.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                if len(deferred) < _MAX_DEFERRED_CLEANUP_FILENAMES:
+                    deferred.append(path.name)
+    return tuple(deferred)
 
 
 def _publish_checkpoint_generation(
@@ -641,7 +649,7 @@ def _publish_checkpoint_generation(
         }
         _atomic_write_manifest(manifest, _manifest_path(output_dir, checked_role))
         _fsync_directory(output_dir)
-        _cleanup_checkpoint_generations(
+        deferred_cleanup = _cleanup_checkpoint_generations(
             output_dir, role=checked_role, retained=(descriptor, previous)
         )
         return ResolvedCheckpoint(
@@ -649,6 +657,7 @@ def _publish_checkpoint_generation(
             descriptor=descriptor,
             payload=checkpoint_payload,
             used_fallback=False,
+            deferred_cleanup=deferred_cleanup,
         )
     finally:
         temporary.unlink(missing_ok=True)

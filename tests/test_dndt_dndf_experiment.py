@@ -537,6 +537,59 @@ def test_successful_publish_retains_only_current_and_previous_generations(
     assert not list(tmp_path.glob("*.tmp"))
 
 
+def test_locked_stale_generation_cleanup_is_deferred_and_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _publish_checkpoint_generation(
+        {"marker": 1}, tmp_path, role="latest_recovery", epoch=1
+    )
+    second = _publish_checkpoint_generation(
+        {"marker": 2}, tmp_path, role="latest_recovery", epoch=2
+    )
+    real_unlink = Path.unlink
+    attempted: list[str] = []
+
+    def reject_locked_stale(path: Path, *args: object, **kwargs: object) -> None:
+        if path.suffix == ".pt":
+            attempted.append(path.name)
+        if path == first.path:
+            raise PermissionError("simulated Windows file lock")
+        real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    with monkeypatch.context() as locked:
+        locked.setattr(Path, "unlink", reject_locked_stale)
+        third = _publish_checkpoint_generation(
+            {"marker": 3}, tmp_path, role="latest_recovery", epoch=3
+        )
+
+    manifest = json.loads(
+        _manifest_path(tmp_path, "latest_recovery").read_text(encoding="utf-8")
+    )
+    assert manifest["current"]["filename"] == third.path.name
+    assert manifest["previous"]["filename"] == second.path.name
+    assert attempted == [first.path.name]
+    assert third.deferred_cleanup == (first.path.name,)
+    assert first.path.exists()
+    resolved = _resolve_checkpoint_manifest(
+        tmp_path, role="latest_recovery", map_location="cpu"
+    )
+    assert resolved.path == third.path
+    assert resolved.payload["marker"] == 3
+
+    fourth = _publish_checkpoint_generation(
+        {"marker": 4}, tmp_path, role="latest_recovery", epoch=4
+    )
+    final_manifest = json.loads(
+        _manifest_path(tmp_path, "latest_recovery").read_text(encoding="utf-8")
+    )
+    retained = {
+        final_manifest["current"]["filename"],
+        final_manifest["previous"]["filename"],
+    }
+    assert fourth.deferred_cleanup == ()
+    assert {path.name for path in tmp_path.glob("latest_recovery-g*.pt")} == retained
+
+
 @pytest.mark.parametrize("failure", ["corrupt", "missing"])
 def test_resume_from_invalid_current_generation_matches_uninterrupted(
     tmp_path: Path, failure: str
