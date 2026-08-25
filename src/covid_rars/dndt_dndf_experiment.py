@@ -26,6 +26,9 @@ from covid_rars.metrics import best_threshold_by_balanced_accuracy
 
 BalanceMethod = Literal["svm_smote", "smote", "class_weight"]
 _SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+SMOTE_K_NEIGHBORS = 5
+SVMSMOTE_K_NEIGHBORS = 5
+SVMSMOTE_M_NEIGHBORS = 10
 
 PREDICTION_COLUMNS = (
     "run_id",
@@ -246,21 +249,39 @@ def balance_training_rows(
             features, labels, requested_method=method, fallback_reason=None
         )
 
-    minimum_required = 11 if method == "svm_smote" else 6
     minority_count = int(counts.min())
-    if minority_count < minimum_required:
+    k_neighbors = (
+        SVMSMOTE_K_NEIGHBORS if method == "svm_smote" else SMOTE_K_NEIGHBORS
+    )
+    if minority_count <= k_neighbors:
         return _class_weight_result(
             features,
             labels,
             requested_method=method,
             fallback_reason=(
-                f"minority count {minority_count} is below the {minimum_required} "
-                f"rows required by the default {method} neighbor configuration"
+                f"minority count {minority_count} must exceed "
+                f"k_neighbors={k_neighbors} for {method}"
+            ),
+        )
+    if method == "svm_smote" and features.shape[0] <= SVMSMOTE_M_NEIGHBORS:
+        return _class_weight_result(
+            features,
+            labels,
+            requested_method=method,
+            fallback_reason=(
+                f"total row count {features.shape[0]} must exceed "
+                f"m_neighbors={SVMSMOTE_M_NEIGHBORS} for svm_smote"
             ),
         )
 
     sampler = (
-        SVMSMOTE(random_state=seed) if method == "svm_smote" else SMOTE(random_state=seed)
+        SVMSMOTE(
+            random_state=seed,
+            k_neighbors=SVMSMOTE_K_NEIGHBORS,
+            m_neighbors=SVMSMOTE_M_NEIGHBORS,
+        )
+        if method == "svm_smote"
+        else SMOTE(random_state=seed, k_neighbors=SMOTE_K_NEIGHBORS)
     )
     try:
         resampled_features, resampled_labels = sampler.fit_resample(features, labels)
@@ -269,7 +290,10 @@ def balance_training_rows(
             features,
             labels,
             requested_method=method,
-            fallback_reason=f"{method} failed safely: {exc}",
+            fallback_reason=(
+                f"{'SVMSMOTE' if method == 'svm_smote' else 'SMOTE'} raised "
+                f"ValueError and fell back safely: {exc}"
+            ),
         )
     after_classes, after_counts = np.unique(resampled_labels, return_counts=True)
     audit = {
@@ -877,18 +901,55 @@ def aggregate_participant_probabilities(predictions: pd.DataFrame) -> pd.DataFra
     )
     if missing_participant.any():
         raise ValueError("participant_id must be present for participant aggregation")
+    missing_recording = frame["recording_id"].isna() | (
+        frame["recording_id"].astype(str).str.strip().eq("")
+    )
+    if missing_recording.any():
+        raise ValueError("recording_id must be present for participant aggregation")
+
+    try:
+        frame["probability"] = pd.to_numeric(frame["probability"], errors="raise")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("probability must be numeric") from exc
+    probability = frame["probability"].to_numpy(dtype=float)
+    if not np.isfinite(probability).all():
+        raise ValueError("probability must be finite")
+    if bool(((probability < 0.0) | (probability > 1.0)).any()):
+        raise ValueError("probability must be within [0, 1]")
+
+    label_tokens: list[object] = []
+    missing_label = np.zeros(len(frame), dtype=bool)
+    invalid_label = np.zeros(len(frame), dtype=bool)
+    for index, value in enumerate(frame["label_binary"].tolist()):
+        is_missing = pd.isna(value)
+        if isinstance(is_missing, (bool, np.bool_)) and bool(is_missing):
+            missing_label[index] = True
+            label_tokens.append("__missing_label__")
+        elif value in (0, "negative"):
+            label_tokens.append(0)
+        elif value in (1, "positive"):
+            label_tokens.append(1)
+        else:
+            invalid_label[index] = True
+            label_tokens.append("__invalid_label__")
+    frame["_label_token"] = label_tokens
+
+    conflict = frame.groupby("participant_id", dropna=False)["_label_token"].nunique(
+        dropna=False
+    )
+    if bool((conflict > 1).any()):
+        ids = conflict[conflict > 1].index.astype(str).tolist()
+        raise ValueError(f"conflicting labels within participant: {ids[:10]}")
+    if missing_label.any():
+        raise ValueError("label_binary must not contain null values")
+    if invalid_label.any():
+        raise ValueError("label_binary must contain only binary labels")
+
     duplicate_recording = frame.duplicated(
         subset=["participant_id", "recording_id"], keep=False
     )
     if duplicate_recording.any():
         raise ValueError("duplicate recording rows would bias the participant mean")
-    conflict = frame.groupby("participant_id", dropna=False)["label_binary"].nunique()
-    if bool((conflict > 1).any()):
-        ids = conflict[conflict > 1].index.astype(str).tolist()
-        raise ValueError(f"conflicting labels within participant: {ids[:10]}")
-    frame["probability"] = pd.to_numeric(frame["probability"], errors="raise")
-    if not np.isfinite(frame["probability"].to_numpy(dtype=float)).all():
-        raise ValueError("participant probabilities must be finite")
     frame = frame.sort_values(["participant_id", "recording_id"], kind="stable")
     result = (
         frame.groupby("participant_id", as_index=False, sort=True)
@@ -900,6 +961,8 @@ def aggregate_participant_probabilities(predictions: pd.DataFrame) -> pd.DataFra
         .sort_values("participant_id", kind="stable")
         .reset_index(drop=True)
     )
+    if bool((result["n_recordings"] <= 0).any()):
+        raise RuntimeError("participant aggregation produced zero valid recordings")
     return result
 
 

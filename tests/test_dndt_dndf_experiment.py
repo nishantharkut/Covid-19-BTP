@@ -149,8 +149,9 @@ def test_oversampling_uses_only_supplied_training_rows(monkeypatch: pytest.Monke
     observed: dict[str, np.ndarray] = {}
 
     class SpySmote:
-        def __init__(self, *, random_state: int) -> None:
+        def __init__(self, *, random_state: int, k_neighbors: int) -> None:
             observed["seed"] = np.array([random_state])
+            observed["k_neighbors"] = np.array([k_neighbors])
 
         def fit_resample(self, features: np.ndarray, labels: np.ndarray):
             observed["features"] = features.copy()
@@ -166,6 +167,7 @@ def test_oversampling_uses_only_supplied_training_rows(monkeypatch: pytest.Monke
 
     np.testing.assert_array_equal(observed["features"], train_x)
     np.testing.assert_array_equal(observed["labels"], train_y)
+    np.testing.assert_array_equal(observed["k_neighbors"], [5])
     assert result.audit["requested_method"] == "smote"
     assert result.audit["applied_method"] == "smote"
 
@@ -182,6 +184,73 @@ def test_too_few_minority_rows_fall_back_without_data_loss(method: str) -> None:
     assert result.audit["applied_method"] == "class_weight"
     assert "minority" in str(result.audit["fallback_reason"]).lower()
     assert result.audit["n_rows_before"] == result.audit["n_rows_after"] == 7
+
+
+def test_svm_smote_accepts_six_minority_rows_with_default_neighbors() -> None:
+    rng = np.random.default_rng(4)
+    features = np.vstack(
+        [rng.normal(0.0, 1.0, size=(20, 3)), rng.normal(0.35, 1.0, size=(6, 3))]
+    )
+    labels = np.array([0] * 20 + [1] * 6)
+
+    result = balance_training_rows(features, labels, method="svm_smote", seed=7)
+
+    assert result.audit["applied_method"] == "svm_smote"
+    assert result.audit["fallback_reason"] is None
+    assert result.audit["n_rows_after"] > result.audit["n_rows_before"]
+    assert result.sample_weights is None
+
+
+def test_svm_smote_five_minority_rows_fall_back_for_k_neighbors() -> None:
+    features = np.arange(75, dtype=float).reshape(25, 3)
+    labels = np.array([0] * 20 + [1] * 5)
+
+    result = balance_training_rows(features, labels, method="svm_smote", seed=7)
+
+    assert result.audit["applied_method"] == "class_weight"
+    assert "k_neighbors=5" in str(result.audit["fallback_reason"])
+    assert "minority count 5" in str(result.audit["fallback_reason"])
+
+
+def test_svm_smote_total_neighborhood_shortfall_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import covid_rars.dndt_dndf_experiment as experiment
+
+    monkeypatch.setattr(experiment, "SVMSMOTE_M_NEIGHBORS", 30, raising=False)
+    features = np.arange(78, dtype=float).reshape(26, 3)
+    labels = np.array([0] * 20 + [1] * 6)
+
+    result = balance_training_rows(features, labels, method="svm_smote", seed=7)
+
+    assert result.audit["applied_method"] == "class_weight"
+    assert "total row count 26" in str(result.audit["fallback_reason"])
+    assert "m_neighbors=30" in str(result.audit["fallback_reason"])
+
+
+def test_svm_smote_value_error_falls_back_with_sampler_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import covid_rars.dndt_dndf_experiment as experiment
+
+    class FailingSvmSmote:
+        def __init__(
+            self, *, random_state: int, k_neighbors: int, m_neighbors: int
+        ) -> None:
+            assert (random_state, k_neighbors, m_neighbors) == (7, 5, 10)
+
+        def fit_resample(self, *_args: object) -> tuple[np.ndarray, np.ndarray]:
+            raise ValueError("forced neighbor failure")
+
+    monkeypatch.setattr(experiment, "SVMSMOTE", FailingSvmSmote)
+    features = np.arange(78, dtype=float).reshape(26, 3)
+    labels = np.array([0] * 20 + [1] * 6)
+
+    result = balance_training_rows(features, labels, method="svm_smote", seed=7)
+
+    assert result.audit["applied_method"] == "class_weight"
+    assert "SVMSMOTE raised ValueError" in str(result.audit["fallback_reason"])
+    assert "forced neighbor failure" in str(result.audit["fallback_reason"])
 
 
 @pytest.mark.parametrize(
@@ -357,6 +426,7 @@ def test_participant_aggregation_is_deterministic_and_rejects_label_conflicts() 
     assert result["participant_id"].tolist() == ["p1", "p2"]
     assert result["probability"].tolist() == pytest.approx([0.7, 0.2])
     assert result["n_recordings"].tolist() == [2, 1]
+    assert bool((result["n_recordings"] > 0).all())
 
     conflicted = frame.copy()
     conflicted.loc[0, "participant_id"] = "p1"
@@ -366,6 +436,78 @@ def test_participant_aggregation_is_deterministic_and_rejects_label_conflicts() 
     duplicated = pd.concat([frame, frame.iloc[[0]]], ignore_index=True)
     with pytest.raises(ValueError, match="duplicate recording"):
         aggregate_participant_probabilities(duplicated)
+
+
+@pytest.mark.parametrize(
+    "column,value",
+    [
+        ("participant_id", None),
+        ("participant_id", "  "),
+        ("recording_id", None),
+        ("recording_id", ""),
+    ],
+)
+def test_participant_aggregation_rejects_missing_or_blank_identifiers(
+    column: str, value: object
+) -> None:
+    frame = pd.DataFrame(
+        {
+            "participant_id": ["p1"],
+            "recording_id": ["r1"],
+            "label_binary": [1],
+            "probability": [0.7],
+        }
+    )
+    frame.loc[0, column] = value
+
+    with pytest.raises(ValueError, match=column):
+        aggregate_participant_probabilities(frame)
+
+
+@pytest.mark.parametrize("label", [None, np.nan, "unknown", 2, -1])
+def test_participant_aggregation_rejects_null_or_nonbinary_labels(label: object) -> None:
+    frame = pd.DataFrame(
+        {
+            "participant_id": ["p1"],
+            "recording_id": ["r1"],
+            "label_binary": [label],
+            "probability": [0.7],
+        }
+    )
+
+    with pytest.raises(ValueError, match="label_binary"):
+        aggregate_participant_probabilities(frame)
+
+
+def test_participant_aggregation_treats_missing_and_known_labels_as_conflict() -> None:
+    frame = pd.DataFrame(
+        {
+            "participant_id": ["p1", "p1"],
+            "recording_id": ["r1", "r2"],
+            "label_binary": [1, None],
+            "probability": [0.7, 0.6],
+        }
+    )
+
+    with pytest.raises(ValueError, match="conflicting labels"):
+        aggregate_participant_probabilities(frame)
+
+
+@pytest.mark.parametrize("probability", ["not-numeric", np.nan, np.inf, -0.01, 1.01])
+def test_participant_aggregation_rejects_invalid_probability_before_grouping(
+    probability: object,
+) -> None:
+    frame = pd.DataFrame(
+        {
+            "participant_id": ["p1"],
+            "recording_id": ["r1"],
+            "label_binary": [1],
+            "probability": [probability],
+        }
+    )
+
+    with pytest.raises(ValueError, match="probability"):
+        aggregate_participant_probabilities(frame)
 
 
 def _prediction_frame(track: str = "B") -> pd.DataFrame:
