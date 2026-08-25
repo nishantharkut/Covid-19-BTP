@@ -1,0 +1,34 @@
+{
+  "author_repo": "G:/Covid-19-BTP/external/COVID-19-Detection-from-Cough-Sound",
+  "author_commit": "feb0e63c790c042eaa21e9f3fc83ed64bdc8a24e",
+  "project_features": "G:/Covid-19-BTP/covid_audio_btp/data/processed/features_compare_is10_top800.csv",
+  "external_features": "G:/Covid-19-BTP/covid_audio_btp/data/processed/coughvid_features_compare_is10_top800.csv",
+  "metadata": "G:/Covid-19-BTP/covid_audio_btp/data/processed/metadata_with_quality.csv",
+  "run_root": "G:/Covid-19-BTP/dndt_dndf_runs",
+  "device": "cuda",
+  "published": {
+    "depth": 11,
+    "used_features_rate": 0.6,
+    "lr": 0.01,
+    "batch": 16,
+    "epochs": 14,
+    "dndt_trees": 1,
+    "dndf_trees": 25
+  },
+  "balancing": {
+    "track_a": "svm_smote",
+    "track_b": "smote"
+  },
+  "selection": {
+    "primary": "auroc",
+    "tie": "auprc",
+    "max_trials_per_modality": 6,
+    "patience": 3
+  },
+  "seeds": {
+    "candidate": [42],
+    "final": [42, 314, 2026]
+  },
+  "modalities": ["breath", "cough", "speech"],
+  "protocols": ["existing", "time_stratified", "early_to_late", "external_cough"]
+}

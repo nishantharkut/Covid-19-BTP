@@ -1,0 +1,8 @@
+-r requirements.txt
+-e .
+imbalanced-learn>=0.14,<0.15
+optuna>=4.5,<5
+joblib>=1.5,<2
+jupyterlab>=4.4,<5
+ipykernel>=6.30,<7
+pytest>=8.4,<9
