@@ -66,6 +66,8 @@ def _validate_features(features: torch.Tensor, expected_features: int) -> None:
         raise ValueError(
             f"expected {expected_features} features, received {features.shape[1]}"
         )
+    if features.shape[0] == 0:
+        raise ValueError("features must contain at least one row")
 
 
 def _make_feature_indices(
@@ -221,30 +223,49 @@ class KerasBatchNorm1d(nn.Module):
     def bias(self) -> nn.Parameter:
         return self.beta
 
+    def _apply(self, fn, recurse: bool = True) -> KerasBatchNorm1d:
+        super()._apply(fn, recurse=recurse)
+        if self.gamma.dtype in {torch.float16, torch.bfloat16}:
+            self.gamma.data = self.gamma.data.float()
+            self.beta.data = self.beta.data.float()
+            if self.gamma.grad is not None:
+                self.gamma.grad.data = self.gamma.grad.data.float()
+            if self.beta.grad is not None:
+                self.beta.grad.data = self.beta.grad.data.float()
+        if self.running_mean.dtype in {torch.float16, torch.bfloat16}:
+            self.running_mean = self.running_mean.float()
+            self.running_var = self.running_var.float()
+        return self
+
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         _validate_features(features, self.num_features)
         if not features.is_floating_point():
             raise ValueError("features must use a floating-point dtype")
 
+        input_dtype = features.dtype
+        low_precision = input_dtype in {torch.float16, torch.bfloat16}
+        statistics_features = features.float() if low_precision else features
         if self.training:
-            mean = features.mean(dim=0)
-            centered = features - mean
+            mean = statistics_features.mean(dim=0)
+            centered = statistics_features - mean
             variance = centered.square().mean(dim=0)
             with torch.no_grad():
                 new_weight = 1.0 - self.momentum
                 self.running_mean.mul_(self.momentum).add_(
-                    mean.detach(), alpha=new_weight
+                    mean.detach().to(self.running_mean.dtype), alpha=new_weight
                 )
                 self.running_var.mul_(self.momentum).add_(
-                    variance.detach(), alpha=new_weight
+                    variance.detach().to(self.running_var.dtype), alpha=new_weight
                 )
         else:
-            mean = self.running_mean
-            variance = self.running_var
-            centered = features - mean
+            mean = self.running_mean.to(statistics_features.dtype)
+            variance = self.running_var.to(statistics_features.dtype)
+            centered = statistics_features - mean
 
         normalized = centered * torch.rsqrt(variance + self.eps)
-        return normalized * self.gamma + self.beta
+        output = normalized * self.gamma.to(normalized.dtype)
+        output = output + self.beta.to(normalized.dtype)
+        return output.to(input_dtype) if low_precision else output
 
 
 class NeuralDecisionClassifier(nn.Module):

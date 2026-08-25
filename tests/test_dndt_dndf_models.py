@@ -8,6 +8,7 @@ import torch
 from torch.nn import functional as F
 
 from covid_rars.dndt_dndf_models import (
+    KerasBatchNorm1d,
     ModelConfig,
     NeuralDecisionClassifier,
     NeuralDecisionForest,
@@ -391,6 +392,100 @@ def test_batch_normalization_preserves_float64_and_autograd() -> None:
     assert features.grad is not None and torch.isfinite(features.grad).all()
     assert normalization.gamma.grad is not None
     assert normalization.beta.grad is not None
+
+
+@pytest.mark.parametrize(
+    "dtype,magnitude",
+    [(torch.float16, 60_000.0), (torch.bfloat16, 10_000_000_000.0)],
+)
+def test_low_precision_batch_normalization_uses_float32_moments_on_cpu(
+    dtype: torch.dtype, magnitude: float
+) -> None:
+    normalization = KerasBatchNorm1d(2).to(dtype=dtype)
+    features = torch.tensor(
+        [[magnitude, -magnitude], [-magnitude, magnitude]], dtype=dtype
+    )
+    features_float = features.float()
+    expected_variance = (
+        (features_float - features_float.mean(dim=0)).square().mean(dim=0)
+    )
+
+    output = normalization(features)
+
+    assert output.dtype == dtype
+    assert torch.isfinite(output).all()
+    assert normalization.running_mean.dtype == torch.float32
+    assert normalization.running_var.dtype == torch.float32
+    assert torch.isfinite(normalization.running_mean).all()
+    assert torch.isfinite(normalization.running_var).all()
+    torch.testing.assert_close(
+        normalization.running_var,
+        0.99 * torch.ones(2) + 0.01 * expected_variance,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_large_value_float16_cuda_batch_normalization_remains_finite() -> None:
+    normalization = KerasBatchNorm1d(2).to(device="cuda", dtype=torch.float16)
+    features = torch.tensor(
+        [[60_000.0, -60_000.0], [-60_000.0, 60_000.0]],
+        device="cuda",
+        dtype=torch.float16,
+        requires_grad=True,
+    )
+    expected_variance = features.detach().float().square().mean(dim=0)
+
+    output = normalization(features)
+    output.float().square().mean().backward()
+
+    assert output.dtype == torch.float16
+    assert torch.isfinite(output).all()
+    assert normalization.running_mean.dtype == torch.float32
+    assert normalization.running_var.dtype == torch.float32
+    assert torch.isfinite(normalization.running_mean).all()
+    assert torch.isfinite(normalization.running_var).all()
+    torch.testing.assert_close(
+        normalization.running_var,
+        0.99 * torch.ones(2, device="cuda") + 0.01 * expected_variance,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    assert features.grad is not None and torch.isfinite(features.grad).all()
+    assert normalization.gamma.grad is not None
+    assert torch.isfinite(normalization.gamma.grad).all()
+
+
+def test_zero_row_batch_is_rejected_without_mutating_running_state() -> None:
+    normalization = KerasBatchNorm1d(2)
+    mean_before = normalization.running_mean.clone()
+    variance_before = normalization.running_var.clone()
+
+    with pytest.raises(ValueError, match="at least one row"):
+        normalization(torch.empty(0, 2))
+
+    torch.testing.assert_close(normalization.running_mean, mean_before)
+    torch.testing.assert_close(normalization.running_var, variance_before)
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        NeuralDecisionTree(2, 2, 1.0),
+        NeuralDecisionForest(2, 2, 2, 1.0),
+        NeuralDecisionClassifier(
+            num_features=2,
+            model_config=ModelConfig("dndt", 1, 2, 1.0),
+            seed=7,
+        ),
+    ],
+)
+def test_all_model_entry_points_reject_zero_row_batches(
+    module: torch.nn.Module,
+) -> None:
+    with pytest.raises(ValueError, match="at least one row"):
+        module(torch.empty(0, 2))
 
 
 def test_probabilities_and_nll_gradients_are_finite() -> None:
