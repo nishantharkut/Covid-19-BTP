@@ -29,6 +29,7 @@ temp/
 archive/local_state/
 
 # Local datasets and generated experiment output
+configs/*.local.json
 /data/raw/
 /data/interim/
 /data/processed/

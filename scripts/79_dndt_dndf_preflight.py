@@ -16,7 +16,8 @@ from typing import Any, Callable
 
 
 GIB = 1024**3
-MINIMUM_CUDA_MEMORY_GIB = 6.0
+DECIMAL_GB = 1_000_000_000
+MINIMUM_CUDA_MEMORY_GB = 6.0
 DEFAULT_MINIMUM_FREE_GIB = 10.0
 EXPECTED_SAMPLE_COUNT = 1319
 EXPECTED_FEATURE_SHAPE = (1319, 193)
@@ -63,6 +64,62 @@ def _header(path: Path) -> list[str]:
 def _duplicate_names(columns: list[str]) -> list[str]:
     counts = Counter(columns)
     return sorted(column for column, count in counts.items() if count > 1)
+
+
+def _validate_numeric_feature_content(
+    path: Path, columns: list[str], feature_columns: list[str]
+) -> None:
+    feature_set = set(feature_columns)
+    feature_indices = {
+        column: index for index, column in enumerate(columns) if column in feature_set
+    }
+    has_finite_value = {column: False for column in feature_columns}
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.reader(handle)
+        try:
+            streamed_header = [column.strip() for column in next(reader)]
+        except StopIteration as exc:
+            raise ValueError(f"CSV has no header: {path}") from exc
+        if streamed_header != columns:
+            raise ValueError(f"CSV header changed while auditing feature content: {path}")
+
+        # Stream one row at a time so memory does not scale with the feature table.
+        for line_number, row in enumerate(reader, start=2):
+            if len(row) != len(columns):
+                raise ValueError(
+                    f"CSV row {line_number} in {path} has {len(row)} fields; "
+                    f"expected {len(columns)}"
+                )
+            for column, index in feature_indices.items():
+                raw = row[index].strip()
+                if not raw:
+                    continue
+                try:
+                    value = float(raw)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"feature column {column!r} contains a nonnumeric value "
+                        f"at CSV row {line_number} in {path}: {raw[:80]!r}"
+                    ) from exc
+                if math.isnan(value):
+                    continue
+                if math.isinf(value):
+                    raise ValueError(
+                        f"feature column {column!r} contains an infinite value "
+                        f"at CSV row {line_number} in {path}: {raw!r}"
+                    )
+                has_finite_value[column] = True
+
+    without_finite_values = [
+        column for column, has_finite in has_finite_value.items() if not has_finite
+    ]
+    if without_finite_values:
+        displayed = ", ".join(repr(column) for column in without_finite_values[:10])
+        if len(without_finite_values) > 10:
+            displayed += f", ... ({len(without_finite_values)} total)"
+        raise ValueError(
+            f"feature columns {displayed} have no finite numeric values in {path}"
+        )
 
 
 def _sha256(path: Path) -> str:
@@ -132,10 +189,13 @@ def validate_runtime(
         raise RuntimeError("CUDA is available but no CUDA devices were reported")
     properties = torch.cuda.get_device_properties(0)
     total_memory_bytes = int(properties.total_memory)
-    if total_memory_bytes < MINIMUM_CUDA_MEMORY_GIB * GIB:
+    total_memory_gb = total_memory_bytes / DECIMAL_GB
+    total_memory_gib = total_memory_bytes / GIB
+    if total_memory_bytes < MINIMUM_CUDA_MEMORY_GB * DECIMAL_GB:
         raise RuntimeError(
-            f"CUDA device 0 has {total_memory_bytes / GIB:.2f} GiB total memory; "
-            f"at least {MINIMUM_CUDA_MEMORY_GIB:.0f} GiB is required"
+            f"CUDA device 0 has {total_memory_gb:.3f} GB "
+            f"(decimal; {total_memory_gib:.3f} GiB) total memory; "
+            f"at least {MINIMUM_CUDA_MEMORY_GB:.2f} GB (decimal) is required"
         )
 
     tiny = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32, device="cuda")
@@ -147,7 +207,9 @@ def validate_runtime(
         {
             "cuda_device_count": device_count,
             "cuda_device_name": str(properties.name),
-            "cuda_total_memory_gib": total_memory_bytes / GIB,
+            "cuda_total_memory_bytes": total_memory_bytes,
+            "cuda_total_memory_gb": total_memory_gb,
+            "cuda_total_memory_gib": total_memory_gib,
             "cuda_probe_value": float(probe.item()),
         }
     )
@@ -174,6 +236,7 @@ def audit_project_feature_table(
             f"expected exactly {expected_feature_count} feature columns in {path}, "
             f"found {len(feature_columns)}"
         )
+    _validate_numeric_feature_content(path, columns, feature_columns)
     return {
         "path": str(path),
         "column_count": len(columns),
@@ -201,6 +264,9 @@ def audit_external_alignment(
             "project and external ordered feature columns do not match: "
             f"{project_path} != {external_path}"
         )
+    _validate_numeric_feature_content(
+        external_path, external_columns, external_features
+    )
     return {
         "project_path": str(project_path),
         "external_path": str(external_path),

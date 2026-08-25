@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -49,14 +49,21 @@ def _write_feature_fixture(
     *,
     feature_names: list[str] | None = None,
     identity_columns: list[str] | None = None,
+    feature_values: list[object] | None = None,
 ) -> Path:
     features = feature_names or [f"feature_{index:03d}" for index in range(800)]
     identities = identity_columns or IDENTITY_COLUMNS
     identity_values: list[object] = ["r1", "p1", "coswara", "cough", "heavy", 1, "train"]
+    values = (
+        feature_values
+        if feature_values is not None
+        else [float(index) for index in range(len(features))]
+    )
+    assert len(values) == len(features)
     return _write_csv(
         path,
         identities + features,
-        identity_values[: len(identities)] + [float(index) for index in range(len(features))],
+        identity_values[: len(identities)] + values,
     )
 
 
@@ -66,6 +73,46 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _fake_cuda_torch(total_memory_bytes: int) -> SimpleNamespace:
+    class Scalar:
+        def __init__(self, value: float | bool) -> None:
+            self.value = value
+
+        def item(self) -> float | bool:
+            return self.value
+
+    class Tensor:
+        def __mul__(self, other: object) -> Tensor:
+            return self
+
+        def sum(self) -> Scalar:
+            return Scalar(14.0)
+
+    class Cuda:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        @staticmethod
+        def device_count() -> int:
+            return 1
+
+        @staticmethod
+        def get_device_properties(index: int) -> SimpleNamespace:
+            assert index == 0
+            return SimpleNamespace(
+                name="NVIDIA GeForce RTX 4050 Laptop GPU",
+                total_memory=total_memory_bytes,
+            )
+
+    return SimpleNamespace(
+        cuda=Cuda(),
+        float32="float32",
+        tensor=lambda *args, **kwargs: Tensor(),
+        isfinite=lambda value: Scalar(True),
+    )
 
 
 def _write_author_repo(path: Path) -> tuple[str, Path, Path]:
@@ -114,6 +161,7 @@ def _write_author_repo(path: Path) -> tuple[str, Path, Path]:
 def test_dependency_and_config_contracts_are_exact() -> None:
     gitignore = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert ".venv-dndt-dndf/" in gitignore
+    assert "configs/*.local.json" in gitignore
 
     requirements = (PROJECT_ROOT / "requirements-dndt-dndf.txt").read_text(
         encoding="utf-8"
@@ -189,6 +237,37 @@ def test_preflight_rejects_cpu_only_torch_for_cuda_mode(
         module.validate_runtime(device="cuda", run_root=tmp_path, minimum_free_gib=0.0)
 
 
+def test_preflight_accepts_nominal_six_gb_rtx_4050_memory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _load_preflight()
+    total_memory_bytes = 6_438_780_928
+    monkeypatch.setattr(
+        module, "_load_torch", lambda: _fake_cuda_torch(total_memory_bytes)
+    )
+
+    audit = module.validate_runtime(
+        device="cuda", run_root=tmp_path, minimum_free_gib=0.0
+    )
+
+    assert audit["cuda_total_memory_gb"] == pytest.approx(6.438780928)
+    assert audit["cuda_total_memory_gib"] == pytest.approx(
+        total_memory_bytes / 1024**3
+    )
+
+
+def test_preflight_rejects_materially_smaller_than_six_decimal_gb(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _load_preflight()
+    monkeypatch.setattr(
+        module, "_load_torch", lambda: _fake_cuda_torch(5_900_000_000)
+    )
+
+    with pytest.raises(RuntimeError, match=r"at least 6\.00 GB \(decimal\)"):
+        module.validate_runtime(device="cuda", run_root=tmp_path, minimum_free_gib=0.0)
+
+
 def test_preflight_accepts_exact_project_feature_schema(tmp_path: Path) -> None:
     module = _load_preflight()
     path = _write_feature_fixture(tmp_path / "features.csv")
@@ -203,6 +282,35 @@ def test_preflight_accepts_exact_project_feature_schema(tmp_path: Path) -> None:
         "required_columns_present": True,
         "feature_columns": feature_names,
     }
+
+
+def test_project_feature_schema_rejects_free_text_as_feature(tmp_path: Path) -> None:
+    module = _load_preflight()
+    features = [f"feature_{index:03d}" for index in range(799)] + ["clinical_notes"]
+    path = _write_feature_fixture(
+        tmp_path / "free-text.csv",
+        feature_names=features,
+        feature_values=[float(index) for index in range(799)] + ["persistent cough"],
+    )
+
+    with pytest.raises(ValueError, match=r"clinical_notes.*nonnumeric"):
+        module.audit_project_feature_table(path)
+
+
+@pytest.mark.parametrize(
+    ("invalid_value", "message"),
+    [(float("inf"), "infinite"), ("", "no finite numeric values")],
+)
+def test_project_feature_schema_rejects_infinite_or_all_missing_feature(
+    tmp_path: Path, invalid_value: object, message: str
+) -> None:
+    module = _load_preflight()
+    values: list[object] = [float(index) for index in range(800)]
+    values[17] = invalid_value
+    path = _write_feature_fixture(tmp_path / "non-finite.csv", feature_values=values)
+
+    with pytest.raises(ValueError, match=rf"feature_017.*{message}"):
+        module.audit_project_feature_table(path)
 
 
 @pytest.mark.parametrize("fault", ["missing_identity", "duplicate_feature"])
@@ -242,6 +350,19 @@ def test_external_features_require_the_same_ordered_columns(tmp_path: Path) -> N
     mismatch = _write_feature_fixture(tmp_path / "mismatch.csv", feature_names=reordered)
     with pytest.raises(ValueError, match="ordered feature columns do not match"):
         module.audit_external_alignment(project, mismatch)
+
+
+def test_external_features_reject_nonnumeric_content(tmp_path: Path) -> None:
+    module = _load_preflight()
+    project = _write_feature_fixture(tmp_path / "project.csv")
+    values: list[object] = [float(index) for index in range(800)]
+    values[23] = "free text"
+    external = _write_feature_fixture(
+        tmp_path / "external-free-text.csv", feature_values=values
+    )
+
+    with pytest.raises(ValueError, match=r"feature_023.*nonnumeric"):
+        module.audit_external_alignment(project, external)
 
 
 def test_metadata_requires_temporal_and_split_columns(tmp_path: Path) -> None:
