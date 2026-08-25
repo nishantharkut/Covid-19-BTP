@@ -17,7 +17,8 @@ from typing import Any, Callable
 
 GIB = 1024**3
 DECIMAL_GB = 1_000_000_000
-MINIMUM_CUDA_MEMORY_GB = 6.0
+MINIMUM_CUDA_MEMORY_BYTES = 6_000_000_000
+MINIMUM_CUDA_MEMORY_GB = MINIMUM_CUDA_MEMORY_BYTES / DECIMAL_GB
 DEFAULT_MINIMUM_FREE_GIB = 10.0
 EXPECTED_SAMPLE_COUNT = 1319
 EXPECTED_FEATURE_SHAPE = (1319, 193)
@@ -191,11 +192,12 @@ def validate_runtime(
     total_memory_bytes = int(properties.total_memory)
     total_memory_gb = total_memory_bytes / DECIMAL_GB
     total_memory_gib = total_memory_bytes / GIB
-    if total_memory_bytes < MINIMUM_CUDA_MEMORY_GB * DECIMAL_GB:
+    if total_memory_bytes < MINIMUM_CUDA_MEMORY_BYTES:
         raise RuntimeError(
-            f"CUDA device 0 has {total_memory_gb:.3f} GB "
-            f"(decimal; {total_memory_gib:.3f} GiB) total memory; "
-            f"at least {MINIMUM_CUDA_MEMORY_GB:.2f} GB (decimal) is required"
+            f"CUDA device 0 has {total_memory_bytes} bytes of total memory "
+            f"({total_memory_gb:.9f} GB decimal; {total_memory_gib:.9f} GiB); "
+            f"at least {MINIMUM_CUDA_MEMORY_BYTES} bytes "
+            f"({MINIMUM_CUDA_MEMORY_GB:.9f} GB decimal) are required"
         )
 
     tiny = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32, device="cuda")

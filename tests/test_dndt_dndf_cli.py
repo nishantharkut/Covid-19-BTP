@@ -194,16 +194,16 @@ def test_dependency_and_config_contracts_are_exact() -> None:
         "published": {
             "depth": 11,
             "used_features_rate": 0.6,
-            "lr": 0.01,
-            "batch": 16,
+            "learning_rate": 0.01,
+            "batch_size": 16,
             "epochs": 14,
             "dndt_trees": 1,
             "dndf_trees": 25,
         },
         "balancing": {"track_a": "svm_smote", "track_b": "smote"},
         "selection": {
-            "primary": "auroc",
-            "tie": "auprc",
+            "primary_metric": "auroc",
+            "tie_breaker": "auprc",
             "max_trials_per_modality": 6,
             "patience": 3,
         },
@@ -264,8 +264,26 @@ def test_preflight_rejects_materially_smaller_than_six_decimal_gb(
         module, "_load_torch", lambda: _fake_cuda_torch(5_900_000_000)
     )
 
-    with pytest.raises(RuntimeError, match=r"at least 6\.00 GB \(decimal\)"):
+    with pytest.raises(RuntimeError, match=r"5900000000 bytes.*6000000000 bytes"):
         module.validate_runtime(device="cuda", run_root=tmp_path, minimum_free_gib=0.0)
+
+
+def test_preflight_rejects_one_byte_below_six_decimal_gb_without_rounding_ambiguity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _load_preflight()
+    monkeypatch.setattr(
+        module, "_load_torch", lambda: _fake_cuda_torch(5_999_999_999)
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        module.validate_runtime(device="cuda", run_root=tmp_path, minimum_free_gib=0.0)
+
+    assert str(exc_info.value) == (
+        "CUDA device 0 has 5999999999 bytes of total memory "
+        "(5.999999999 GB decimal; 5.587935447 GiB); "
+        "at least 6000000000 bytes (6.000000000 GB decimal) are required"
+    )
 
 
 def test_preflight_accepts_exact_project_feature_schema(tmp_path: Path) -> None:
