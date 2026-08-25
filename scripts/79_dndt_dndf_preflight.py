@@ -249,19 +249,43 @@ def audit_project_feature_table(
 
 
 def audit_external_alignment(
-    project_path: Path, external_path: Path
+    project_path: Path,
+    external_path: Path,
+    project_audit: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     project_path = Path(project_path)
     external_path = Path(external_path)
-    project = audit_project_feature_table(project_path)
+    project = (
+        audit_project_feature_table(project_path)
+        if project_audit is None
+        else project_audit
+    )
+    if Path(str(project.get("path", ""))) != project_path:
+        raise ValueError(
+            f"project audit path does not match requested project table: {project_path}"
+        )
+    project_features = project.get("feature_columns")
+    if not isinstance(project_features, list) or not all(
+        isinstance(column, str) for column in project_features
+    ):
+        raise ValueError("project audit does not contain ordered feature_columns")
+
     external_columns = _header(external_path)
     duplicates = _duplicate_names(external_columns)
     if duplicates:
         raise ValueError(f"duplicate column names in {external_path}: {duplicates}")
+    missing = [
+        column for column in PROJECT_IDENTITY_COLUMNS if column not in external_columns
+    ]
+    if missing:
+        raise ValueError(
+            f"external feature table {external_path} is missing required identity columns: "
+            f"{missing}"
+        )
     external_features = [
         column for column in external_columns if column not in PROJECT_IDENTITY_COLUMNS
     ]
-    if external_features != project["feature_columns"]:
+    if external_features != project_features:
         raise ValueError(
             "project and external ordered feature columns do not match: "
             f"{project_path} != {external_path}"
@@ -518,13 +542,24 @@ def run_preflight(
         "project_features",
         lambda: audit_project_feature_table(configured_path("project_features")),
     )
+
+    def audit_configured_external_alignment() -> dict[str, Any]:
+        project_audit = audits.get("project_features")
+        if project_audit is None:
+            raise RuntimeError(
+                "external alignment requires a successful project feature audit"
+            )
+        return audit_external_alignment(
+            configured_path("project_features"),
+            configured_path("external_features"),
+            project_audit=project_audit,
+        )
+
     _record_check(
         audits,
         errors,
         "external_alignment",
-        lambda: audit_external_alignment(
-            configured_path("project_features"), configured_path("external_features")
-        ),
+        audit_configured_external_alignment,
     )
     _record_check(
         audits,

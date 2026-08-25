@@ -370,6 +370,23 @@ def test_external_features_require_the_same_ordered_columns(tmp_path: Path) -> N
         module.audit_external_alignment(project, mismatch)
 
 
+def test_external_features_require_all_project_identity_columns(tmp_path: Path) -> None:
+    module = _load_preflight()
+    project = _write_feature_fixture(tmp_path / "project.csv")
+    external_identities = [
+        column for column in IDENTITY_COLUMNS if column != "label_binary"
+    ]
+    external = _write_feature_fixture(
+        tmp_path / "external-missing-label.csv",
+        identity_columns=external_identities,
+    )
+
+    with pytest.raises(
+        ValueError, match=r"external.*missing required identity columns.*label_binary"
+    ):
+        module.audit_external_alignment(project, external)
+
+
 def test_external_features_reject_nonnumeric_content(tmp_path: Path) -> None:
     module = _load_preflight()
     project = _write_feature_fixture(tmp_path / "project.csv")
@@ -430,6 +447,78 @@ def test_author_audit_verifies_arrays_first_index_column_and_ten_folds(
     assert audit["folds"]["fold_count"] == 10
     assert audit["folds"]["test_union_count"] == 1319
     assert len(audit["folds"]["sha256"]) == 20
+
+
+def test_run_preflight_ready_path_reuses_project_audit_and_is_json_serializable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_preflight()
+    project = _write_feature_fixture(tmp_path / "project.csv")
+    external = _write_feature_fixture(tmp_path / "external.csv")
+    metadata = _write_csv(
+        tmp_path / "metadata.csv",
+        ["participant_id", "label_binary", "split", "recording_date"],
+    )
+    config_path = tmp_path / "ready.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "author_repo": str(tmp_path / "synthetic-author"),
+                "author_commit": "a" * 40,
+                "project_features": str(project),
+                "external_features": str(external),
+                "metadata": str(metadata),
+                "run_root": str(tmp_path / "runs"),
+                "device": "cpu",
+                "minimum_free_gib": 0.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    real_project_audit = module.audit_project_feature_table
+    project_audit_calls = 0
+
+    def counting_project_audit(path: Path) -> dict[str, object]:
+        nonlocal project_audit_calls
+        project_audit_calls += 1
+        return real_project_audit(path)
+
+    monkeypatch.setattr(module, "audit_project_feature_table", counting_project_audit)
+    monkeypatch.setattr(
+        module,
+        "validate_runtime",
+        lambda device, run_root, minimum_free_gib: {
+            "device": device,
+            "run_root": str(run_root),
+            "run_root_writable": True,
+            "minimum_free_gib": minimum_free_gib,
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "audit_author_artifacts",
+        lambda author_repo, expected_commit: {
+            "author_repo": str(author_repo),
+            "head": expected_commit,
+            "tracked_worktree_clean": True,
+        },
+    )
+
+    audit = module.run_preflight(config_path, device_override="cpu")
+
+    assert audit["status"] == "ready"
+    assert audit["errors"] == []
+    assert set(audit["audits"]) == {
+        "runtime",
+        "project_features",
+        "external_alignment",
+        "metadata",
+        "author_artifacts",
+    }
+    assert audit["audits"]["external_alignment"]["ordered_features_match"] is True
+    assert project_audit_calls == 1
+    assert json.loads(json.dumps(audit)) == audit
 
 
 def test_run_preflight_and_cli_emit_blocked_json_without_real_data(
