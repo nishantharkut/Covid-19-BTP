@@ -25,7 +25,12 @@ from covid_rars.metrics import best_threshold_by_balanced_accuracy
 
 
 BalanceMethod = Literal["svm_smote", "smote", "class_weight"]
+CheckpointRole = Literal["latest_recovery", "best_inference"]
 _SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+_CHECKPOINT_ROLES: dict[str, str] = {
+    "latest_recovery": "recovery",
+    "best_inference": "inference",
+}
 SMOTE_K_NEIGHBORS = 5
 SVMSMOTE_K_NEIGHBORS = 5
 SVMSMOTE_M_NEIGHBORS = 10
@@ -102,6 +107,14 @@ class BalanceResult:
     labels: np.ndarray
     sample_weights: np.ndarray | None
     audit: dict[str, object]
+
+
+@dataclass(frozen=True)
+class ResolvedCheckpoint:
+    path: Path
+    descriptor: dict[str, object]
+    payload: dict[str, object]
+    used_fallback: bool
 
 
 class PlannedInterruption(RuntimeError):
@@ -366,6 +379,17 @@ def checkpoint_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def _checkpoint_role(role: str) -> CheckpointRole:
+    if role not in _CHECKPOINT_ROLES:
+        raise ValueError(f"unknown checkpoint role: {role}")
+    return role  # type: ignore[return-value]
+
+
+def _manifest_path(directory: str | Path, role: str) -> Path:
+    checked_role = _checkpoint_role(role)
+    return Path(directory) / f"{checked_role}.manifest.json"
+
+
 def _atomic_text_write(text: str, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
@@ -423,9 +447,7 @@ def _atomic_torch_save(payload: dict[str, object], path: str | Path) -> str:
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
-    digest = checkpoint_sha256(destination)
-    _atomic_text_write(digest + "\n", destination.with_suffix(destination.suffix + ".sha256"))
-    return digest
+    return checkpoint_sha256(destination)
 
 
 def _atomic_json_write(payload: dict[str, object], path: Path) -> None:
@@ -434,22 +456,247 @@ def _atomic_json_write(payload: dict[str, object], path: Path) -> None:
     )
 
 
-def _load_trusted_checkpoint(path: Path, *, map_location: torch.device) -> dict[str, object]:
+def _atomic_write_manifest(payload: dict[str, object], path: Path) -> None:
+    _atomic_json_write(payload, path)
+
+
+def _fsync_directory(directory: Path) -> None:
+    if os.name != "posix" or not hasattr(os, "O_DIRECTORY"):
+        return
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _read_manifest(directory: Path, role: CheckpointRole) -> dict[str, object] | None:
+    path = _manifest_path(directory, role)
     if path.is_symlink() or not path.is_file():
-        raise ValueError(f"trusted local checkpoint is unavailable: {path}")
-    sidecar = path.with_suffix(path.suffix + ".sha256")
-    if sidecar.is_symlink() or not sidecar.is_file():
-        raise ValueError(f"checkpoint hash sidecar is unavailable: {sidecar}")
-    expected = sidecar.read_text(encoding="ascii").strip()
-    _validate_sha256("checkpoint sidecar", expected)
-    if checkpoint_sha256(path) != expected.lower():
-        raise ValueError("checkpoint SHA256 mismatch; refusing deserialization")
-    # This loader accepts pickle only for hash-verified files generated locally by
-    # _atomic_torch_save. It is never used for downloaded or user-supplied inputs.
-    payload = torch.load(path, map_location=map_location, weights_only=False)
-    if not isinstance(payload, dict):
-        raise ValueError("trusted checkpoint payload must be a dictionary")
-    return payload
+        return None
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("format_version") != 1
+        or manifest.get("role") != role
+    ):
+        return None
+    return manifest
+
+
+def _validated_descriptor(
+    value: object, *, role: CheckpointRole
+) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    filename = value.get("filename")
+    digest = value.get("sha256")
+    epoch = value.get("epoch")
+    generation = value.get("generation")
+    kind = value.get("kind")
+    if (
+        not isinstance(filename, str)
+        or not filename
+        or Path(filename).name != filename
+        or not isinstance(digest, str)
+        or _SHA256_PATTERN.fullmatch(digest) is None
+        or isinstance(epoch, bool)
+        or not isinstance(epoch, int)
+        or epoch < 0
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 1
+        or kind != _CHECKPOINT_ROLES[role]
+    ):
+        return None
+    normalized = {
+        "filename": filename,
+        "sha256": digest.lower(),
+        "epoch": epoch,
+        "generation": generation,
+        "kind": kind,
+    }
+    expected_filename = (
+        f"{role}-g{generation:06d}-e{epoch:06d}-{digest.lower()}.pt"
+    )
+    return normalized if filename == expected_filename else None
+
+
+def _descriptor_has_valid_bytes(directory: Path, descriptor: object) -> bool:
+    if not isinstance(descriptor, dict):
+        return False
+    filename = descriptor.get("filename")
+    expected = descriptor.get("sha256")
+    if not isinstance(filename, str) or not isinstance(expected, str):
+        return False
+    path = directory / filename
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        return checkpoint_sha256(path) == expected.lower()
+    except OSError:
+        return False
+
+
+def _next_generation(directory: Path, role: CheckpointRole) -> int:
+    pattern = re.compile(
+        rf"^{re.escape(role)}-g(?P<generation>\d+)-e\d+-[0-9a-f]{{64}}\.pt$"
+    )
+    generations = [
+        int(match.group("generation"))
+        for path in directory.glob(f"{role}-g*-e*-*.pt")
+        if (match := pattern.fullmatch(path.name)) is not None
+    ]
+    return max(generations, default=0) + 1
+
+
+def _cleanup_checkpoint_generations(
+    directory: Path,
+    *,
+    role: CheckpointRole,
+    retained: tuple[dict[str, object] | None, ...],
+) -> None:
+    keep = {
+        str(descriptor["filename"])
+        for descriptor in retained
+        if isinstance(descriptor, dict) and isinstance(descriptor.get("filename"), str)
+    }
+    pattern = re.compile(
+        rf"^{re.escape(role)}-g\d+-e\d+-[0-9a-f]{{64}}\.pt$"
+    )
+    for path in directory.glob(f"{role}-g*-e*-*.pt"):
+        if pattern.fullmatch(path.name) and path.name not in keep:
+            path.unlink(missing_ok=True)
+
+
+def _publish_checkpoint_generation(
+    payload: dict[str, object],
+    directory: str | Path,
+    *,
+    role: str,
+    epoch: int,
+) -> ResolvedCheckpoint:
+    checked_role = _checkpoint_role(role)
+    _require_integer("epoch", epoch, minimum=0)
+    output_dir = Path(directory)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    generation = _next_generation(output_dir, checked_role)
+    temporary = output_dir / f".{checked_role}-g{generation:06d}.pending.tmp"
+    checkpoint_payload = dict(payload)
+    existing_role = checkpoint_payload.get("checkpoint_role")
+    if existing_role not in (None, checked_role):
+        raise ValueError("checkpoint payload role conflicts with publication role")
+    checkpoint_payload["checkpoint_role"] = checked_role
+    try:
+        with temporary.open("wb") as handle:
+            torch.save(_canonical_checkpoint_graph(checkpoint_payload), handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        provisional_digest = checkpoint_sha256(temporary)
+        filename = (
+            f"{checked_role}-g{generation:06d}-e{epoch:06d}-"
+            f"{provisional_digest}.pt"
+        )
+        destination = output_dir / filename
+        if destination.exists():
+            if checkpoint_sha256(destination) != provisional_digest:
+                raise RuntimeError("immutable checkpoint generation collision")
+            temporary.unlink()
+        else:
+            os.replace(temporary, destination)
+        with destination.open("rb+") as handle:
+            os.fsync(handle.fileno())
+        _fsync_directory(output_dir)
+        final_digest = checkpoint_sha256(destination)
+        if final_digest != provisional_digest:
+            raise RuntimeError("checkpoint changed while publishing immutable generation")
+
+        descriptor: dict[str, object] = {
+            "filename": filename,
+            "sha256": final_digest,
+            "epoch": epoch,
+            "generation": generation,
+            "kind": _CHECKPOINT_ROLES[checked_role],
+        }
+        old_manifest = _read_manifest(output_dir, checked_role)
+        previous: dict[str, object] | None = None
+        if old_manifest is not None:
+            for candidate_name in ("current", "previous"):
+                candidate = _validated_descriptor(
+                    old_manifest.get(candidate_name), role=checked_role
+                )
+                if candidate is not None and _descriptor_has_valid_bytes(
+                    output_dir, candidate
+                ):
+                    previous = candidate
+                    break
+        manifest: dict[str, object] = {
+            "format_version": 1,
+            "role": checked_role,
+            "current": descriptor,
+            "previous": previous,
+        }
+        _atomic_write_manifest(manifest, _manifest_path(output_dir, checked_role))
+        _fsync_directory(output_dir)
+        _cleanup_checkpoint_generations(
+            output_dir, role=checked_role, retained=(descriptor, previous)
+        )
+        return ResolvedCheckpoint(
+            path=destination,
+            descriptor=descriptor,
+            payload=checkpoint_payload,
+            used_fallback=False,
+        )
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _resolve_checkpoint_manifest(
+    directory: str | Path,
+    *,
+    role: str,
+    map_location: str | torch.device,
+) -> ResolvedCheckpoint:
+    checked_role = _checkpoint_role(role)
+    output_dir = Path(directory)
+    manifest = _read_manifest(output_dir, checked_role)
+    if manifest is None:
+        raise ValueError(f"checkpoint manifest is unavailable for {checked_role}")
+    failures: list[str] = []
+    for position, candidate_name in enumerate(("current", "previous")):
+        descriptor = _validated_descriptor(
+            manifest.get(candidate_name), role=checked_role
+        )
+        if descriptor is None:
+            failures.append(f"{candidate_name}: invalid descriptor")
+            continue
+        path = output_dir / str(descriptor["filename"])
+        if not _descriptor_has_valid_bytes(output_dir, descriptor):
+            failures.append(f"{candidate_name}: missing or SHA256 mismatch")
+            continue
+        try:
+            # Pickle is enabled only after validating immutable bytes against the
+            # atomic manifest produced by this module. External checkpoints are
+            # never accepted by this loader.
+            payload = torch.load(path, map_location=map_location, weights_only=False)
+        except Exception as exc:
+            failures.append(f"{candidate_name}: deserialization failed ({exc})")
+            continue
+        if not isinstance(payload, dict) or payload.get("checkpoint_role") != checked_role:
+            failures.append(f"{candidate_name}: payload role/type mismatch")
+            continue
+        return ResolvedCheckpoint(
+            path=path,
+            descriptor=descriptor,
+            payload=payload,
+            used_fallback=position == 1,
+        )
+    raise ValueError(
+        f"no valid {checked_role} checkpoint generation: {'; '.join(failures)}"
+    )
 
 
 def _preprocessor_state(preprocessor: FittedPreprocessor) -> dict[str, object]:
@@ -474,6 +721,26 @@ def _seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def normalize_execution_backend(device: str | torch.device) -> str:
+    try:
+        requested = torch.device(device)
+    except (TypeError, RuntimeError) as exc:
+        raise ValueError(f"invalid execution backend: {device}") from exc
+    if requested.type == "cpu":
+        return "cpu"
+    if requested.type != "cuda":
+        raise ValueError("execution backend must be CPU or CUDA")
+    if not torch.cuda.is_available():
+        raise ValueError("CUDA was requested but is unavailable")
+    index = requested.index
+    if index is None:
+        index = 0
+    count = int(torch.cuda.device_count())
+    if index < 0 or index >= count:
+        raise ValueError(f"CUDA device index {index} is unavailable (device_count={count})")
+    return f"cuda:{index}"
 
 
 def _rng_state() -> dict[str, object]:
@@ -544,7 +811,7 @@ def _predict_probabilities(
     return result
 
 
-def _checkpoint_payload(
+def _recovery_checkpoint_payload(
     *,
     model: NeuralDecisionClassifier,
     optimizer: torch.optim.Optimizer,
@@ -561,9 +828,11 @@ def _checkpoint_payload(
     input_feature_hash: str,
     split_hash: str,
     code_revision: str,
+    execution_backend: str,
 ) -> dict[str, object]:
     return {
         "format_version": 1,
+        "checkpoint_role": "latest_recovery",
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "completed_epoch": completed_epoch,
@@ -582,6 +851,42 @@ def _checkpoint_payload(
             _configuration_payload(model_config, train_config)
         ),
         "code_revision": code_revision,
+        "execution_backend": execution_backend,
+    }
+
+
+def _best_inference_checkpoint_payload(
+    *,
+    best_state: dict[str, torch.Tensor],
+    best_epoch: int,
+    best_auroc: float,
+    best_auprc: float,
+    model_config: ModelConfig,
+    train_config: TrainConfig,
+    preprocessor_state: dict[str, object],
+    balancing_audit: dict[str, object],
+    input_feature_hash: str,
+    split_hash: str,
+    code_revision: str,
+    execution_backend: str,
+) -> dict[str, object]:
+    return {
+        "format_version": 1,
+        "checkpoint_role": "best_inference",
+        "model_state": best_state,
+        "best_epoch": best_epoch,
+        "best_metrics": {"auroc": best_auroc, "auprc": best_auprc},
+        "model_config": asdict(model_config),
+        "train_config": asdict(train_config),
+        "preprocessor_state": preprocessor_state,
+        "balancing_audit": balancing_audit,
+        "input_feature_hash": input_feature_hash,
+        "split_hash": split_hash,
+        "configuration_sha256": _canonical_sha256(
+            _configuration_payload(model_config, train_config)
+        ),
+        "code_revision": code_revision,
+        "execution_backend": execution_backend,
     }
 
 
@@ -595,9 +900,11 @@ def _validate_resume_payload(
     input_feature_hash: str,
     split_hash: str,
     code_revision: str,
+    execution_backend: str,
 ) -> None:
     expected = {
         "format_version": 1,
+        "checkpoint_role": "latest_recovery",
         "model_config": asdict(model_config),
         "train_config": asdict(train_config),
         "preprocessor_state": preprocessor_state,
@@ -608,10 +915,49 @@ def _validate_resume_payload(
             _configuration_payload(model_config, train_config)
         ),
         "code_revision": code_revision,
+        "execution_backend": execution_backend,
     }
     mismatches = [key for key, value in expected.items() if payload.get(key) != value]
     if mismatches:
+        if "execution_backend" in mismatches:
+            raise ValueError(
+                "execution_backend mismatch: checkpoint="
+                f"{payload.get('execution_backend')!r}, requested={execution_backend!r}"
+            )
         raise ValueError(f"resume fingerprint/config/code mismatch: {mismatches}")
+
+
+def _best_checkpoint_matches(
+    actual: dict[str, object], expected: dict[str, object]
+) -> bool:
+    fingerprint_keys = (
+        "format_version",
+        "checkpoint_role",
+        "best_epoch",
+        "model_config",
+        "train_config",
+        "preprocessor_state",
+        "balancing_audit",
+        "input_feature_hash",
+        "split_hash",
+        "configuration_sha256",
+        "code_revision",
+        "execution_backend",
+    )
+    if any(actual.get(key) != expected.get(key) for key in fingerprint_keys):
+        return False
+    actual_metrics = actual.get("best_metrics")
+    expected_metrics = expected.get("best_metrics")
+    if not isinstance(actual_metrics, dict) or not isinstance(expected_metrics, dict):
+        return False
+    for metric in ("auroc", "auprc"):
+        actual_value = float(actual_metrics.get(metric, float("nan")))
+        expected_value = float(expected_metrics.get(metric, float("nan")))
+        if math.isnan(actual_value) and math.isnan(expected_value):
+            continue
+        if actual_value != expected_value:
+            return False
+    return True
 
 
 def fit_model(
@@ -662,10 +1008,8 @@ def fit_model(
     if np.unique(train_labels).size != 2:
         raise ValueError("training_labels must contain both classes")
 
-    torch_device = torch.device(device)
-    if torch_device.type == "cuda" and not torch.cuda.is_available():
-        raise ValueError("CUDA was requested but is unavailable")
-    _seed_everything(train_config.seed)
+    execution_backend = normalize_execution_backend(device)
+    torch_device = torch.device(execution_backend)
 
     preprocessor = fit_preprocessor(train_matrix)
     transformed_train = transform_features(preprocessor, train_matrix)
@@ -680,8 +1024,25 @@ def fit_model(
 
     output_dir = Path(checkpoint_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    latest_path = output_dir / "latest.pt"
-    best_path = output_dir / "best.pt"
+    resume_payload: dict[str, object] | None = None
+    if resume:
+        resolved_recovery = _resolve_checkpoint_manifest(
+            output_dir, role="latest_recovery", map_location="cpu"
+        )
+        resume_payload = resolved_recovery.payload
+        _validate_resume_payload(
+            resume_payload,
+            model_config=model_config,
+            train_config=train_config,
+            preprocessor_state=preprocessing_state,
+            balancing_audit=balanced.audit,
+            input_feature_hash=input_feature_hash,
+            split_hash=split_hash,
+            code_revision=code_revision,
+            execution_backend=execution_backend,
+        )
+
+    _seed_everything(train_config.seed)
     model = NeuralDecisionClassifier(
         num_features=transformed_train.shape[1],
         model_config=model_config,
@@ -700,32 +1061,21 @@ def fit_model(
     best_state: dict[str, torch.Tensor] | None = None
     early_stop_counter = 0
     completed_epoch = 0
-    if resume:
-        payload = _load_trusted_checkpoint(latest_path, map_location=torch.device("cpu"))
-        _validate_resume_payload(
-            payload,
-            model_config=model_config,
-            train_config=train_config,
-            preprocessor_state=preprocessing_state,
-            balancing_audit=balanced.audit,
-            input_feature_hash=input_feature_hash,
-            split_hash=split_hash,
-            code_revision=code_revision,
-        )
-        model.load_state_dict(payload["model_state"])  # type: ignore[arg-type]
-        optimizer.load_state_dict(payload["optimizer_state"])  # type: ignore[arg-type]
+    if resume_payload is not None:
+        model.load_state_dict(resume_payload["model_state"])  # type: ignore[arg-type]
+        optimizer.load_state_dict(resume_payload["optimizer_state"])  # type: ignore[arg-type]
         _move_optimizer_state(optimizer, torch_device)
-        completed_epoch = int(payload["completed_epoch"])
+        completed_epoch = int(resume_payload["completed_epoch"])
         start_epoch = completed_epoch + 1
-        best_epoch = int(payload["best_epoch"])
-        metrics = payload["best_metrics"]
+        best_epoch = int(resume_payload["best_epoch"])
+        metrics = resume_payload["best_metrics"]
         if not isinstance(metrics, dict):
             raise ValueError("checkpoint best metrics are invalid")
         best_auroc = float(metrics["auroc"])
         best_auprc = float(metrics["auprc"])
-        best_state = copy.deepcopy(payload["best_state"])  # type: ignore[arg-type]
-        early_stop_counter = int(payload["early_stop_counter"])
-        _restore_rng_state(payload["rng_state"])
+        best_state = copy.deepcopy(resume_payload["best_state"])  # type: ignore[arg-type]
+        early_stop_counter = int(resume_payload["early_stop_counter"])
+        _restore_rng_state(resume_payload["rng_state"])
         if early_stop_counter >= train_config.patience:
             start_epoch = train_config.max_epochs + 1
 
@@ -791,7 +1141,7 @@ def fit_model(
         if best_state is None:
             raise RuntimeError("training did not produce a model state")
         completed_epoch = epoch
-        payload = _checkpoint_payload(
+        recovery_payload = _recovery_checkpoint_payload(
             model=model,
             optimizer=optimizer,
             completed_epoch=epoch,
@@ -807,10 +1157,35 @@ def fit_model(
             input_feature_hash=input_feature_hash,
             split_hash=split_hash,
             code_revision=code_revision,
+            execution_backend=execution_backend,
         )
         if improved:
-            _atomic_torch_save(payload, best_path)
-        _atomic_torch_save(payload, latest_path)
+            inference_payload = _best_inference_checkpoint_payload(
+                best_state=best_state,
+                best_epoch=best_epoch,
+                best_auroc=best_auroc,
+                best_auprc=best_auprc,
+                model_config=model_config,
+                train_config=train_config,
+                preprocessor_state=preprocessing_state,
+                balancing_audit=balanced.audit,
+                input_feature_hash=input_feature_hash,
+                split_hash=split_hash,
+                code_revision=code_revision,
+                execution_backend=execution_backend,
+            )
+            _publish_checkpoint_generation(
+                inference_payload,
+                output_dir,
+                role="best_inference",
+                epoch=best_epoch,
+            )
+        _publish_checkpoint_generation(
+            recovery_payload,
+            output_dir,
+            role="latest_recovery",
+            epoch=epoch,
+        )
 
         if interrupt_after_epoch == epoch:
             raise PlannedInterruption(f"planned interruption after epoch {epoch}")
@@ -820,15 +1195,11 @@ def fit_model(
     if best_state is None or best_epoch < 1 or completed_epoch < 1:
         raise RuntimeError("no validation-selected checkpoint is available")
     model.load_state_dict(best_state)
-    final_best_payload = _checkpoint_payload(
-        model=model,
-        optimizer=optimizer,
-        completed_epoch=completed_epoch,
+    final_best_payload = _best_inference_checkpoint_payload(
         best_state=best_state,
         best_epoch=best_epoch,
         best_auroc=best_auroc,
         best_auprc=best_auprc,
-        early_stop_counter=early_stop_counter,
         model_config=model_config,
         train_config=train_config,
         preprocessor_state=preprocessing_state,
@@ -836,8 +1207,21 @@ def fit_model(
         input_feature_hash=input_feature_hash,
         split_hash=split_hash,
         code_revision=code_revision,
+        execution_backend=execution_backend,
     )
-    _atomic_torch_save(final_best_payload, best_path)
+    try:
+        best_checkpoint = _resolve_checkpoint_manifest(
+            output_dir, role="best_inference", map_location="cpu"
+        )
+        if not _best_checkpoint_matches(best_checkpoint.payload, final_best_payload):
+            raise ValueError("best inference checkpoint does not match selected epoch")
+    except ValueError:
+        best_checkpoint = _publish_checkpoint_generation(
+            final_best_payload,
+            output_dir,
+            role="best_inference",
+            epoch=best_epoch,
+        )
     validation_probability = _predict_probabilities(
         model,
         transformed_validation,
@@ -850,8 +1234,11 @@ def fit_model(
     threshold = best_threshold_by_balanced_accuracy(
         validation_labels_array, validation_probability
     )
-    best_hash = checkpoint_sha256(best_path)
-    latest_hash = checkpoint_sha256(latest_path)
+    latest_checkpoint = _resolve_checkpoint_manifest(
+        output_dir, role="latest_recovery", map_location="cpu"
+    )
+    best_hash = str(best_checkpoint.descriptor["sha256"])
+    latest_hash = str(latest_checkpoint.descriptor["sha256"])
     _atomic_json_write(
         {
             "status": "complete",
@@ -872,7 +1259,20 @@ def fit_model(
             "input_feature_hash": input_feature_hash,
             "split_hash": split_hash,
             "code_revision": code_revision,
+            "execution_backend": execution_backend,
             "balancing_audit": balanced.audit,
+            "checkpoints": {
+                "latest_recovery": {
+                    **latest_checkpoint.descriptor,
+                    "path": str(latest_checkpoint.path),
+                    "role": "latest_recovery",
+                },
+                "best_inference": {
+                    **best_checkpoint.descriptor,
+                    "path": str(best_checkpoint.path),
+                    "role": "best_inference",
+                },
+            },
         },
         output_dir / "completion.json",
     )
@@ -881,7 +1281,7 @@ def fit_model(
         validation_auroc=validation_auroc,
         validation_auprc=validation_auprc,
         threshold=float(threshold),
-        checkpoint_path=best_path,
+        checkpoint_path=best_checkpoint.path,
         validation_probability=validation_probability,
     )
 

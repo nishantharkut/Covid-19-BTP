@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import math
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -17,12 +18,16 @@ from covid_rars.dndt_dndf_experiment import (
     PlannedInterruption,
     TrainConfig,
     _atomic_torch_save,
+    _manifest_path,
+    _publish_checkpoint_generation,
+    _resolve_checkpoint_manifest,
     aggregate_participant_probabilities,
     balance_training_rows,
     checkpoint_sha256,
     deterministic_batch_indices,
     fit_model,
     fit_preprocessor,
+    normalize_execution_backend,
     transform_features,
     validate_prediction_frame,
     write_predictions,
@@ -296,8 +301,8 @@ def test_interruption_resume_matches_uninterrupted_training(tmp_path: Path) -> N
     assert checkpoint_sha256(resumed.checkpoint_path) == checkpoint_sha256(
         uninterrupted.checkpoint_path
     )
-    assert (tmp_path / "resumed" / "latest.pt").exists()
-    assert (tmp_path / "resumed" / "best.pt").exists()
+    assert _manifest_path(tmp_path / "resumed", "latest_recovery").exists()
+    assert _manifest_path(tmp_path / "resumed", "best_inference").exists()
     assert (tmp_path / "resumed" / "completion.json").exists()
 
 
@@ -320,9 +325,13 @@ def test_resume_does_not_train_past_an_already_reached_patience_stop(
     resumed = _fit(tmp_path / "resumed-stop", train_config=config, resume=True)
 
     assert full.best_epoch == resumed.best_epoch == 1
-    assert checkpoint_sha256(tmp_path / "full-stop" / "latest.pt") == checkpoint_sha256(
-        tmp_path / "resumed-stop" / "latest.pt"
+    full_latest = _resolve_checkpoint_manifest(
+        tmp_path / "full-stop", role="latest_recovery", map_location="cpu"
     )
+    resumed_latest = _resolve_checkpoint_manifest(
+        tmp_path / "resumed-stop", role="latest_recovery", map_location="cpu"
+    )
+    assert full_latest.descriptor["sha256"] == resumed_latest.descriptor["sha256"]
     np.testing.assert_allclose(
         full.validation_probability, resumed.validation_probability, atol=1e-7
     )
@@ -363,15 +372,21 @@ def test_resume_reconstructs_best_checkpoint_from_durable_latest_state(
     )
     with pytest.raises(PlannedInterruption):
         _fit(tmp_path, interrupt_after_epoch=2)
-    (tmp_path / "best.pt").unlink()
-    (tmp_path / "best.pt.sha256").unlink()
+    best_manifest = _manifest_path(tmp_path, "best_inference")
+    manifest = json.loads(best_manifest.read_text(encoding="utf-8"))
+    for descriptor in (manifest.get("current"), manifest.get("previous")):
+        if descriptor:
+            (tmp_path / descriptor["filename"]).unlink(missing_ok=True)
+    best_manifest.unlink()
 
     result = _fit(tmp_path, resume=True)
 
     assert result.checkpoint_path.is_file()
-    assert checkpoint_sha256(result.checkpoint_path) == (
-        tmp_path / "best.pt.sha256"
-    ).read_text(encoding="ascii").strip()
+    rebuilt = _resolve_checkpoint_manifest(
+        tmp_path, role="best_inference", map_location="cpu"
+    )
+    assert result.checkpoint_path == rebuilt.path
+    assert checkpoint_sha256(result.checkpoint_path) == rebuilt.descriptor["sha256"]
 
 
 @pytest.mark.parametrize("mismatch", ["feature", "split", "config", "code"])
@@ -381,8 +396,10 @@ def test_resume_rejects_provenance_mismatch_before_checkpoint_mutation(
     run_dir = tmp_path / mismatch
     with pytest.raises(PlannedInterruption):
         _fit(run_dir, interrupt_after_epoch=2)
-    latest = run_dir / "latest.pt"
-    digest_before = checkpoint_sha256(latest)
+    latest = _resolve_checkpoint_manifest(
+        run_dir, role="latest_recovery", map_location="cpu"
+    )
+    digest_before = latest.descriptor["sha256"]
     kwargs: dict[str, object] = {"resume": True}
     if mismatch == "feature":
         kwargs["feature_sha"] = _sha("other-features")
@@ -395,7 +412,10 @@ def test_resume_rejects_provenance_mismatch_before_checkpoint_mutation(
 
     with pytest.raises(ValueError, match="mismatch"):
         _fit(run_dir, **kwargs)  # type: ignore[arg-type]
-    assert checkpoint_sha256(latest) == digest_before
+    latest_after = _resolve_checkpoint_manifest(
+        run_dir, role="latest_recovery", map_location="cpu"
+    )
+    assert latest_after.descriptor["sha256"] == digest_before
 
 
 def test_atomic_checkpoint_removes_temporary_file_on_failure(
@@ -411,6 +431,246 @@ def test_atomic_checkpoint_removes_temporary_file_on_failure(
         _atomic_torch_save({"epoch": 1}, destination)
     assert not destination.exists()
     assert not (tmp_path / ".latest.pt.tmp").exists()
+
+
+def test_generation_publish_failure_before_manifest_keeps_old_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import covid_rars.dndt_dndf_experiment as experiment
+
+    first = _publish_checkpoint_generation(
+        {"marker": 1}, tmp_path, role="latest_recovery", epoch=1
+    )
+    manifest_path = _manifest_path(tmp_path, "latest_recovery")
+    manifest_before = manifest_path.read_bytes()
+
+    def fail_manifest(*_args: object, **_kwargs: object) -> None:
+        raise OSError("power loss before manifest replacement")
+
+    monkeypatch.setattr(experiment, "_atomic_write_manifest", fail_manifest)
+    with pytest.raises(OSError, match="power loss"):
+        _publish_checkpoint_generation(
+            {"marker": 2}, tmp_path, role="latest_recovery", epoch=2
+        )
+
+    assert manifest_path.read_bytes() == manifest_before
+    resolved = _resolve_checkpoint_manifest(
+        tmp_path, role="latest_recovery", map_location="cpu"
+    )
+    assert resolved.path == first.path
+    assert resolved.payload["marker"] == 1
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("failure", ["corrupt", "missing"])
+def test_manifest_resolution_falls_back_without_deserializing_invalid_current(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    first = _publish_checkpoint_generation(
+        {"marker": 1}, tmp_path, role="latest_recovery", epoch=1
+    )
+    second = _publish_checkpoint_generation(
+        {"marker": 2}, tmp_path, role="latest_recovery", epoch=2
+    )
+    if failure == "corrupt":
+        second.path.write_bytes(b"corrupt generation")
+    else:
+        second.path.unlink()
+
+    real_load = torch.load
+    loaded_paths: list[Path] = []
+
+    def observe_load(path: Path, *args: object, **kwargs: object):
+        loaded_paths.append(Path(path))
+        return real_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", observe_load)
+    resolved = _resolve_checkpoint_manifest(
+        tmp_path, role="latest_recovery", map_location="cpu"
+    )
+
+    assert resolved.used_fallback is True
+    assert resolved.path == first.path
+    assert resolved.payload["marker"] == 1
+    assert loaded_paths == [first.path]
+
+
+def test_manifest_descriptor_must_match_immutable_generation_identity(
+    tmp_path: Path,
+) -> None:
+    first = _publish_checkpoint_generation(
+        {"marker": 1}, tmp_path, role="latest_recovery", epoch=1
+    )
+    _publish_checkpoint_generation(
+        {"marker": 2}, tmp_path, role="latest_recovery", epoch=2
+    )
+    manifest_path = _manifest_path(tmp_path, "latest_recovery")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["current"]["epoch"] = 99
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    resolved = _resolve_checkpoint_manifest(
+        tmp_path, role="latest_recovery", map_location="cpu"
+    )
+
+    assert resolved.used_fallback is True
+    assert resolved.path == first.path
+
+
+def test_successful_publish_retains_only_current_and_previous_generations(
+    tmp_path: Path,
+) -> None:
+    for epoch in range(1, 5):
+        _publish_checkpoint_generation(
+            {"marker": epoch}, tmp_path, role="latest_recovery", epoch=epoch
+        )
+
+    manifest = json.loads(
+        _manifest_path(tmp_path, "latest_recovery").read_text(encoding="utf-8")
+    )
+    retained = {
+        manifest["current"]["filename"],
+        manifest["previous"]["filename"],
+    }
+    actual = {path.name for path in tmp_path.glob("latest_recovery-g*.pt")}
+    assert actual == retained
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("failure", ["corrupt", "missing"])
+def test_resume_from_invalid_current_generation_matches_uninterrupted(
+    tmp_path: Path, failure: str
+) -> None:
+    full = _fit(tmp_path / "full")
+    with pytest.raises(PlannedInterruption):
+        _fit(tmp_path / "recover", interrupt_after_epoch=2)
+    current = _resolve_checkpoint_manifest(
+        tmp_path / "recover", role="latest_recovery", map_location="cpu"
+    )
+    if failure == "corrupt":
+        current.path.write_bytes(b"simulated interrupted disk write")
+    else:
+        current.path.unlink()
+
+    resumed = _fit(tmp_path / "recover", resume=True)
+
+    np.testing.assert_allclose(
+        resumed.validation_probability, full.validation_probability, atol=1e-7
+    )
+    assert resumed.best_epoch == full.best_epoch
+    assert checkpoint_sha256(resumed.checkpoint_path) == checkpoint_sha256(
+        full.checkpoint_path
+    )
+
+
+def test_best_and_latest_checkpoint_roles_are_not_conflated(tmp_path: Path) -> None:
+    result = _fit(tmp_path)
+    latest = _resolve_checkpoint_manifest(
+        tmp_path, role="latest_recovery", map_location="cpu"
+    )
+    best = _resolve_checkpoint_manifest(
+        tmp_path, role="best_inference", map_location="cpu"
+    )
+
+    assert latest.payload["checkpoint_role"] == "latest_recovery"
+    for key in (
+        "optimizer_state",
+        "completed_epoch",
+        "rng_state",
+        "early_stop_counter",
+    ):
+        assert key in latest.payload
+        assert key not in best.payload
+    assert best.payload["checkpoint_role"] == "best_inference"
+    assert best.payload["best_epoch"] == result.best_epoch
+    assert result.checkpoint_path == best.path
+    receipt = json.loads((tmp_path / "completion.json").read_text(encoding="utf-8"))
+    assert receipt["execution_backend"] == "cpu"
+    assert receipt["checkpoints"]["latest_recovery"]["sha256"] == latest.descriptor[
+        "sha256"
+    ]
+    assert receipt["checkpoints"]["best_inference"]["sha256"] == best.descriptor[
+        "sha256"
+    ]
+
+
+def test_final_best_checkpoint_rejects_stale_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import covid_rars.dndt_dndf_experiment as experiment
+
+    monkeypatch.setattr(
+        experiment, "_safe_validation_metrics", lambda *_args: (0.5, 0.5)
+    )
+    with pytest.raises(PlannedInterruption):
+        _fit(tmp_path, interrupt_after_epoch=2)
+    selected = _resolve_checkpoint_manifest(
+        tmp_path, role="best_inference", map_location="cpu"
+    )
+    stale_payload = dict(selected.payload)
+    stale_payload["input_feature_hash"] = _sha("stale-feature-contract")
+    _publish_checkpoint_generation(
+        stale_payload,
+        tmp_path,
+        role="best_inference",
+        epoch=int(stale_payload["best_epoch"]),
+    )
+
+    result = _fit(tmp_path, resume=True)
+    rebuilt = _resolve_checkpoint_manifest(
+        tmp_path, role="best_inference", map_location="cpu"
+    )
+
+    assert result.checkpoint_path == rebuilt.path
+    assert rebuilt.payload["input_feature_hash"] == _sha("features")
+
+
+def test_backend_normalization_and_cpu_cuda_resume_mismatch(
+    tmp_path: Path,
+) -> None:
+    assert normalize_execution_backend("cpu") == "cpu"
+    assert normalize_execution_backend(torch.device("cpu")) == "cpu"
+    with pytest.raises(PlannedInterruption):
+        _fit(tmp_path / "cpu", interrupt_after_epoch=1, device="cpu")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    assert normalize_execution_backend("cuda") == normalize_execution_backend("cuda:0")
+    with pytest.raises(ValueError, match="execution_backend.*mismatch"):
+        _fit(tmp_path / "cpu", resume=True, device="cuda")
+
+    with pytest.raises(PlannedInterruption):
+        _fit(tmp_path / "cuda", interrupt_after_epoch=1, device="cuda:0")
+    with pytest.raises(ValueError, match="execution_backend.*mismatch"):
+        _fit(tmp_path / "cuda", resume=True, device="cpu")
+
+
+def test_bare_cuda_normalizes_to_cuda_zero_independent_of_current_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+
+    assert normalize_execution_backend("cuda") == "cuda:0"
+    assert normalize_execution_backend("cuda:0") == "cuda:0"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_different_cuda_index_is_rejected_before_model_state_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import covid_rars.dndt_dndf_experiment as experiment
+
+    with pytest.raises(PlannedInterruption):
+        _fit(tmp_path, interrupt_after_epoch=1, device="cuda:0")
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+
+    def forbidden_load(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("model state must not load after backend mismatch")
+
+    monkeypatch.setattr(experiment.NeuralDecisionClassifier, "load_state_dict", forbidden_load)
+    with pytest.raises(ValueError, match="execution_backend.*mismatch"):
+        _fit(tmp_path, resume=True, device="cuda:1")
 
 
 def test_participant_aggregation_is_deterministic_and_rejects_label_conflicts() -> None:
@@ -572,7 +832,7 @@ def test_cuda_resume_matches_uninterrupted_probabilities(tmp_path: Path) -> None
             interrupt_after_epoch=1,
         )
     resumed = _fit(
-        tmp_path / "cuda-resume", train_config=config, device="cuda", resume=True
+        tmp_path / "cuda-resume", train_config=config, device="cuda:0", resume=True
     )
     np.testing.assert_allclose(
         resumed.validation_probability, full.validation_probability, rtol=0.0, atol=1e-6
@@ -580,3 +840,10 @@ def test_cuda_resume_matches_uninterrupted_probabilities(tmp_path: Path) -> None
     assert checkpoint_sha256(resumed.checkpoint_path) == checkpoint_sha256(
         full.checkpoint_path
     )
+    full_latest = _resolve_checkpoint_manifest(
+        tmp_path / "cuda-full", role="latest_recovery", map_location="cpu"
+    )
+    resumed_latest = _resolve_checkpoint_manifest(
+        tmp_path / "cuda-resume", role="latest_recovery", map_location="cpu"
+    )
+    assert resumed_latest.descriptor["sha256"] == full_latest.descriptor["sha256"]
