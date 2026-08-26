@@ -879,12 +879,12 @@ def test_candidate_receipt_metrics_are_recomputed_from_authenticated_predictions
             "probability": probabilities,
             "threshold": [threshold] * 4,
             "analysis_unit": ["recording"] * 4,
-            "n_recordings": [1] * 4,
         }
     )
     participant = recording.copy()
     participant["recording_id"] = participant["participant_id"]
     participant["analysis_unit"] = "participant"
+    participant["n_recordings"] = 1
     metrics = complete_metric_bundle(
         np.array([0, 0, 1, 1]), np.array(probabilities), threshold=threshold
     ) | {"analysis_unit": "participant"}

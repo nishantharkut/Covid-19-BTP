@@ -1185,7 +1185,7 @@ def _load_track_b_candidate_receipt(
         participant = pd.read_csv(
             Path(str(artifacts["participant_predictions"]["path"])), low_memory=False  # type: ignore[index]
         )
-        required_columns = {
+        recording_columns = {
             "recording_id",
             "participant_id",
             "dataset",
@@ -1195,9 +1195,11 @@ def _load_track_b_candidate_receipt(
             "probability",
             "threshold",
             "analysis_unit",
+        }
+        participant_columns = recording_columns | {
             "n_recordings",
         }
-        if set(recording) != required_columns or set(participant) != required_columns:
+        if set(recording) != recording_columns or set(participant) != participant_columns:
             raise ValueError("candidate prediction artifact schema is invalid")
         if not recording["analysis_unit"].astype(str).eq("recording").all():
             raise ValueError("candidate recording analysis unit is invalid")
