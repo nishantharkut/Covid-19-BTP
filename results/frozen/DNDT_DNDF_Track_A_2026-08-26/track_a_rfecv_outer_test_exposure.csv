@@ -1,0 +1,11 @@
+fold,n_outer_test,n_outer_test_in_rfecv_training,outer_test_exposed_fraction,exposed_author_positive,exposed_author_negative,exposed_covid_positive,exposed_covid_negative,rfecv_selection_train_n,rfecv_selection_holdout_n,selection_random_state,selection_test_fraction,selection_scope
+0,132,107,0.8106060606060606,91,16,16,91,1055,264,42,0.2,single_global_author_pass
+1,132,104,0.7878787878787878,86,18,18,86,1055,264,42,0.2,single_global_author_pass
+2,132,110,0.8333333333333334,93,17,17,93,1055,264,42,0.2,single_global_author_pass
+3,132,103,0.7803030303030303,90,13,13,90,1055,264,42,0.2,single_global_author_pass
+4,132,105,0.7954545454545454,91,14,14,91,1055,264,42,0.2,single_global_author_pass
+5,132,101,0.7651515151515151,87,14,14,87,1055,264,42,0.2,single_global_author_pass
+6,132,105,0.7954545454545454,91,14,14,91,1055,264,42,0.2,single_global_author_pass
+7,132,112,0.8484848484848485,96,16,16,96,1055,264,42,0.2,single_global_author_pass
+8,132,106,0.803030303030303,91,15,15,91,1055,264,42,0.2,single_global_author_pass
+9,131,102,0.7786259541984732,87,15,15,87,1055,264,42,0.2,single_global_author_pass
