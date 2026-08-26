@@ -680,6 +680,7 @@ def test_track_a_fold_batch_parser_and_cli_smoke_are_machine_readable(
             "0-3",
         ],
         runner=fake_runner,
+        revision_resolver=lambda: "task4-clean-source-test",
     )
 
     assert exit_code == 0
@@ -729,6 +730,60 @@ def test_track_a_cli_parser_failures_use_one_machine_readable_envelope(
     assert envelope["error_type"] == "CliArgumentError"
     assert isinstance(envelope["message"], str) and envelope["message"]
     assert set(envelope) == {"status", "error_type", "message"}
+
+
+def test_track_a_cli_allows_untracked_files_but_rejects_dirty_tracked_source(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_track_a_cli()
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    def git(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(repository), *arguments],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    git("init")
+    git("config", "user.email", "test@example.invalid")
+    git("config", "user.name", "Track A Test")
+    tracked = repository / "tracked.py"
+    tracked.write_text("value = 1\n", encoding="utf-8")
+    git("add", "tracked.py")
+    git("commit", "-m", "initial")
+    expected_revision = git("rev-parse", "HEAD").stdout.strip()
+
+    assert module._code_revision(repository) == expected_revision
+    (repository / "untracked-runtime.json").write_text("{}\n", encoding="utf-8")
+    assert module._code_revision(repository) == expected_revision
+
+    tracked.write_text("value = 2\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="tracked source tree is dirty"):
+        module._code_revision(repository)
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"run_root": str(tmp_path / "runs"), "device": "cpu"}),
+        encoding="utf-8",
+    )
+
+    def forbidden_runner(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise AssertionError("scientific execution started with dirty tracked source")
+
+    exit_code = module.main(
+        ["--config", str(config_path), "--run-id", "dirty-source"],
+        runner=forbidden_runner,
+        revision_resolver=lambda: module._code_revision(repository),
+    )
+    envelope = json.loads(capsys.readouterr().out)
+    assert exit_code != 0
+    assert envelope["status"] == "failed"
+    assert envelope["error_type"] == "RuntimeError"
+    assert "tracked source tree is dirty" in envelope["message"]
 
 
 def test_author_mode_rejects_late_fold_batch_without_preceding_state(

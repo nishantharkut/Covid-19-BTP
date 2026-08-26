@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import copy
 import csv
+import ctypes
 import hashlib
+import io
 import json
 import math
 import os
 import random
 import re
+import socket
 import subprocess
+import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Literal, Mapping, Sequence
@@ -38,6 +44,8 @@ _CHECKPOINT_ROLES: dict[str, str] = {
     "best_inference": "inference",
 }
 _MAX_DEFERRED_CLEANUP_FILENAMES = 32
+_RFECV_LOCK_TIMEOUT_SECONDS = 300.0
+_RFECV_STALE_LOCK_SECONDS = 6.0 * 60.0 * 60.0
 SMOTE_K_NEIGHBORS = 5
 SVMSMOTE_K_NEIGHBORS = 5
 SVMSMOTE_M_NEIGHBORS = 10
@@ -105,6 +113,9 @@ _TRACK_A_COLUMNS = (
     "feature_indices_sha256",
     "feature_cache_key",
     "code_revision",
+    "execution_backend",
+    "predicted_label",
+    "threshold_comparator",
 )
 
 
@@ -202,7 +213,9 @@ class TrackAFoldContext:
     configuration_sha256: str
     split_sha256: str
     code_revision: str
+    execution_backend: str
     threshold_source: str
+    threshold_comparator: str
     reconstruction_seed: int
     checkpoint_path: Path
     checkpoint_sha256: str
@@ -621,7 +634,7 @@ def fixed_order_batch_indices(n_rows: int, batch_size: int) -> list[np.ndarray]:
 
 def _atomic_numpy_save(array: np.ndarray, path: Path) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("wb") as handle:
             np.save(handle, array, allow_pickle=False)
@@ -631,6 +644,118 @@ def _atomic_numpy_save(array: np.ndarray, path: Path) -> str:
     finally:
         temporary.unlink(missing_ok=True)
     return checkpoint_sha256(path)
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        process_query_limited_information = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(  # type: ignore[attr-defined]
+            process_query_limited_information,
+            False,
+            pid,
+        )
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
+            return True
+        return ctypes.windll.kernel32.GetLastError() == 5  # type: ignore[attr-defined]
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _remove_stale_lock(path: Path, *, stale_after: float) -> bool:
+    try:
+        stat = path.stat()
+        raw = path.read_text(encoding="utf-8")
+        owner = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        try:
+            malformed_grace = min(stale_after, 5.0)
+            if time.time() - path.stat().st_mtime <= malformed_grace:
+                return False
+        except OSError:
+            return True
+    else:
+        if not isinstance(owner, dict):
+            malformed_grace = min(stale_after, 5.0)
+            if time.time() - stat.st_mtime <= malformed_grace:
+                return False
+            return _unlink_lock(path)
+        age = time.time() - float(owner.get("created_at", stat.st_mtime))
+        owner_host = owner.get("hostname")
+        owner_pid = owner.get("pid")
+        if owner_host == socket.gethostname() and isinstance(owner_pid, int):
+            return False if _pid_is_running(owner_pid) else _unlink_lock(path)
+        if age <= stale_after:
+            return False
+    return _unlink_lock(path)
+
+
+def _unlink_lock(path: Path) -> bool:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+@contextmanager
+def _exclusive_rfecv_cache_lock(
+    path: Path,
+    *,
+    timeout: float = _RFECV_LOCK_TIMEOUT_SECONDS,
+    stale_after: float = _RFECV_STALE_LOCK_SECONDS,
+):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    owner = {
+        "format_version": 1,
+        "token": token,
+        "pid": os.getpid(),
+        "hostname": socket.gethostname(),
+        "created_at": time.time(),
+    }
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            descriptor = os.open(
+                path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+        except FileExistsError:
+            if _remove_stale_lock(path, stale_after=stale_after):
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for RFECV cache lock: {path}")
+            time.sleep(0.05)
+            continue
+        try:
+            encoded = (
+                json.dumps(owner, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+            os.write(descriptor, encoded)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        break
+    try:
+        yield
+    finally:
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(current, dict) and current.get("token") == token:
+                path.unlink(missing_ok=True)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
 
 
 def _track_a_rfecv_payload(artifacts: AuthorTrackAArtifacts) -> dict[str, object]:
@@ -738,66 +863,67 @@ def prepare_track_a_rfecv_cache(
     payload = _track_a_rfecv_payload(artifacts)
     cache_key = _canonical_sha256(payload)
     cache_dir = Path(run_root) / "cache" / f"track_a_rfecv_{cache_key}"
-    cached = _load_valid_track_a_cache(
-        cache_dir,
-        expected_payload=payload,
-        cache_key=cache_key,
-        expected_rows=artifacts.features.shape[0],
-        expected_indices=expected,
-    )
-    if cached is not None:
-        return cached
-
-    selection_train, _, labels_train, _ = train_test_split(
-        artifacts.features,
-        artifacts.author_labels,
-        test_size=0.20,
-        random_state=42,
-    )
-    selector = RFECV(
-        estimator=ExtraTreesClassifier(n_estimators=50, random_state=0),
-        step=1,
-        cv=StratifiedKFold(10),
-        scoring="roc_auc",
-        min_features_to_select=1,
-    )
-    selector.fit(selection_train, labels_train)
-    selected_indices = np.flatnonzero(np.asarray(selector.support_, dtype=bool)).astype(
-        np.int64
-    )
-    if expected is not None and not np.array_equal(selected_indices, expected):
-        raise RuntimeError(
-            "RFECV selected indices differ from the pinned author reconstruction: "
-            f"expected {expected.tolist()}, found {selected_indices.tolist()}"
-        )
-    selected_features = np.asarray(
-        artifacts.features[:, selected_indices], dtype=np.float64
-    )
     cache_dir.mkdir(parents=True, exist_ok=True)
-    selected_features_sha256 = _atomic_numpy_save(
-        selected_features, cache_dir / "selected_features.npy"
-    )
-    selected_indices_sha256 = _atomic_numpy_save(
-        selected_indices, cache_dir / "selected_indices.npy"
-    )
-    manifest = {
-        **payload,
-        "cache_key": cache_key,
-        "selected_count": int(len(selected_indices)),
-        "selected_indices": selected_indices.tolist(),
-        "selected_features_shape": list(selected_features.shape),
-        "selected_features_sha256": selected_features_sha256,
-        "selected_indices_sha256": selected_indices_sha256,
-    }
-    _atomic_json_write(manifest, cache_dir / "manifest.json")
-    return TrackAFeatureCache(
-        selected_features=selected_features,
-        selected_indices=selected_indices,
-        cache_key=cache_key,
-        selected_features_sha256=selected_features_sha256,
-        selected_indices_sha256=selected_indices_sha256,
-        manifest_path=cache_dir / "manifest.json",
-    )
+    with _exclusive_rfecv_cache_lock(cache_dir / ".rfecv-cache.lock"):
+        cached = _load_valid_track_a_cache(
+            cache_dir,
+            expected_payload=payload,
+            cache_key=cache_key,
+            expected_rows=artifacts.features.shape[0],
+            expected_indices=expected,
+        )
+        if cached is not None:
+            return cached
+
+        selection_train, _, labels_train, _ = train_test_split(
+            artifacts.features,
+            artifacts.author_labels,
+            test_size=0.20,
+            random_state=42,
+        )
+        selector = RFECV(
+            estimator=ExtraTreesClassifier(n_estimators=50, random_state=0),
+            step=1,
+            cv=StratifiedKFold(10),
+            scoring="roc_auc",
+            min_features_to_select=1,
+        )
+        selector.fit(selection_train, labels_train)
+        selected_indices = np.flatnonzero(
+            np.asarray(selector.support_, dtype=bool)
+        ).astype(np.int64)
+        if expected is not None and not np.array_equal(selected_indices, expected):
+            raise RuntimeError(
+                "RFECV selected indices differ from the pinned author reconstruction: "
+                f"expected {expected.tolist()}, found {selected_indices.tolist()}"
+            )
+        selected_features = np.asarray(
+            artifacts.features[:, selected_indices], dtype=np.float64
+        )
+        selected_features_sha256 = _atomic_numpy_save(
+            selected_features, cache_dir / "selected_features.npy"
+        )
+        selected_indices_sha256 = _atomic_numpy_save(
+            selected_indices, cache_dir / "selected_indices.npy"
+        )
+        manifest = {
+            **payload,
+            "cache_key": cache_key,
+            "selected_count": int(len(selected_indices)),
+            "selected_indices": selected_indices.tolist(),
+            "selected_features_shape": list(selected_features.shape),
+            "selected_features_sha256": selected_features_sha256,
+            "selected_indices_sha256": selected_indices_sha256,
+        }
+        _atomic_json_write(manifest, cache_dir / "manifest.json")
+        return TrackAFeatureCache(
+            selected_features=selected_features,
+            selected_indices=selected_indices,
+            cache_key=cache_key,
+            selected_features_sha256=selected_features_sha256,
+            selected_indices_sha256=selected_indices_sha256,
+            manifest_path=cache_dir / "manifest.json",
+        )
 
 
 def _canonical_sha256(payload: object) -> str:
@@ -843,7 +969,7 @@ def _manifest_path(directory: str | Path, role: str) -> Path:
 
 def _atomic_text_write(text: str, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
@@ -855,7 +981,7 @@ def _atomic_text_write(text: str, path: Path) -> None:
 
 
 def _canonical_checkpoint_graph(value: object) -> object:
-    """Rebuild a payload with deterministic aliasing before torch serialization."""
+    """Build a deterministic graph accepted by torch's restricted loader."""
     primitive_pool: dict[tuple[type[object], str], object] = {}
 
     def rebuild(item: object) -> object:
@@ -874,16 +1000,74 @@ def _canonical_checkpoint_graph(value: object) -> object:
         if isinstance(item, torch.Tensor):
             return item.detach().cpu().clone()
         if isinstance(item, np.ndarray):
-            return item.copy()
+            return {
+                "__covid_rars_safe_type__": "numpy.ndarray",
+                "dtype": item.dtype.str,
+                "shape": list(item.shape),
+                "values": item.tolist(),
+            }
+        if isinstance(item, np.generic):
+            return rebuild(item.item())
         if isinstance(item, dict):
             return {rebuild(key): rebuild(child) for key, child in item.items()}
         if isinstance(item, tuple):
             return tuple(rebuild(child) for child in item)
         if isinstance(item, list):
             return [rebuild(child) for child in item]
-        return copy.deepcopy(item)
+        raise TypeError(
+            "checkpoint payload contains an unsupported unsafe type: "
+            f"{type(item).__module__}.{type(item).__qualname__}"
+        )
 
     return rebuild(value)
+
+
+def _restore_checkpoint_graph(value: object) -> object:
+    if isinstance(value, dict):
+        if value.get("__covid_rars_safe_type__") == "numpy.ndarray":
+            if set(value) != {
+                "__covid_rars_safe_type__",
+                "dtype",
+                "shape",
+                "values",
+            }:
+                raise ValueError("checkpoint NumPy payload schema is invalid")
+            dtype = value.get("dtype")
+            shape = value.get("shape")
+            if not isinstance(dtype, str) or not isinstance(shape, list):
+                raise ValueError("checkpoint NumPy payload metadata is invalid")
+            array = np.asarray(value.get("values"), dtype=np.dtype(dtype))
+            expected_shape = tuple(int(dimension) for dimension in shape)
+            if array.shape != expected_shape:
+                raise ValueError("checkpoint NumPy payload shape is invalid")
+            return array
+        return {
+            _restore_checkpoint_graph(key): _restore_checkpoint_graph(child)
+            for key, child in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_restore_checkpoint_graph(child) for child in value)
+    if isinstance(value, list):
+        return [_restore_checkpoint_graph(child) for child in value]
+    if value is None or isinstance(value, (bool, int, float, str, torch.Tensor)):
+        return value
+    raise ValueError(
+        "restricted checkpoint contained an unsupported decoded type: "
+        f"{type(value).__module__}.{type(value).__qualname__}"
+    )
+
+
+def _read_verified_checkpoint_bytes(path: Path, expected_sha256: str) -> bytes:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("checkpoint is missing or is not a regular file")
+    try:
+        with path.open("rb") as handle:
+            payload = handle.read()
+    except OSError as exc:
+        raise ValueError("checkpoint bytes cannot be read") from exc
+    if hashlib.sha256(payload).hexdigest() != expected_sha256.lower():
+        raise ValueError("checkpoint SHA256 mismatch")
+    return payload
 
 
 def _atomic_torch_save(payload: dict[str, object], path: str | Path) -> str:
@@ -1132,14 +1316,17 @@ def _resolve_checkpoint_manifest(
             failures.append(f"{candidate_name}: invalid descriptor")
             continue
         path = output_dir / str(descriptor["filename"])
-        if not _descriptor_has_valid_bytes(output_dir, descriptor):
-            failures.append(f"{candidate_name}: missing or SHA256 mismatch")
-            continue
         try:
-            # Pickle is enabled only after validating immutable bytes against the
-            # atomic manifest produced by this module. External checkpoints are
-            # never accepted by this loader.
-            payload = torch.load(path, map_location=map_location, weights_only=False)
+            checkpoint_bytes = _read_verified_checkpoint_bytes(
+                path,
+                str(descriptor["sha256"]),
+            )
+            loaded = torch.load(
+                io.BytesIO(checkpoint_bytes),
+                map_location=map_location,
+                weights_only=True,
+            )
+            payload = _restore_checkpoint_graph(loaded)
         except Exception as exc:
             failures.append(f"{candidate_name}: deserialization failed ({exc})")
             continue
@@ -1281,16 +1468,14 @@ def author_threshold_sweep(
         "fp": int(fp),
         "fn": int(fn),
         "tp": int(tp),
+        "covid_prediction": covid_prediction,
     }
 
 
 def author_threshold_to_covid_threshold(author_threshold: float) -> float:
     if not math.isfinite(author_threshold) or not 0.0 <= author_threshold < 1.0:
         raise ValueError("author_threshold must be finite and within [0, 1)")
-    boundary = 1.0 - float(author_threshold)
-    if boundary >= 1.0:
-        return 1.0
-    return float(np.nextafter(boundary, 1.0))
+    return 1.0 - float(author_threshold)
 
 
 def _selection_key(auroc: float, auprc: float) -> tuple[float, float]:
@@ -1806,6 +1991,7 @@ class _TrackACorrectedFit:
     checkpoint_path: Path
     checkpoint_sha256: str
     balancing_audit: dict[str, object]
+    history: tuple[dict[str, object], ...]
 
 
 def _create_track_a_model_optimizer(
@@ -1876,6 +2062,7 @@ def _track_a_corrected_fit_no_scaler(
     resume: bool,
     interrupt_after_epoch: int | None,
 ) -> _TrackACorrectedFit:
+    execution_backend = normalize_execution_backend(device)
     balanced = balance_training_rows(
         training_features,
         training_author_labels,
@@ -1902,7 +2089,7 @@ def _track_a_corrected_fit_no_scaler(
         "feature_sha256": feature_sha256,
         "split_sha256": split_sha256,
         "code_revision": code_revision,
-        "execution_backend": str(device),
+        "execution_backend": execution_backend,
         "external_scaler": False,
     }
     start_epoch = 1
@@ -1911,11 +2098,17 @@ def _track_a_corrected_fit_no_scaler(
     best_auprc = float("nan")
     best_state: dict[str, torch.Tensor] | None = None
     no_improvement = 0
+    history: list[dict[str, object]] = []
     if resume and _manifest_path(checkpoint_dir, "latest_recovery").is_file():
         recovered = _resolve_checkpoint_manifest(
             checkpoint_dir, role="latest_recovery", map_location="cpu"
         )
         payload = recovered.payload
+        if payload.get("execution_backend") != execution_backend:
+            raise ValueError(
+                "execution_backend mismatch: checkpoint="
+                f"{payload.get('execution_backend')!r}, requested={execution_backend!r}"
+            )
         if payload.get("track_a_fingerprint") != fingerprint:
             raise ValueError("corrected Track A resume fingerprint mismatch")
         model.load_state_dict(payload["model_state"])  # type: ignore[arg-type]
@@ -1927,7 +2120,13 @@ def _track_a_corrected_fit_no_scaler(
         best_auprc = float(payload["best_auprc"])
         best_state = copy.deepcopy(payload["best_state"])  # type: ignore[arg-type]
         no_improvement = int(payload["no_improvement"])
+        recovered_history = payload.get("history")
+        if not isinstance(recovered_history, list):
+            raise ValueError("corrected Track A checkpoint history is invalid")
+        history = copy.deepcopy(recovered_history)
         _restore_rng_state(payload["rng_state"])
+        if no_improvement >= patience:
+            start_epoch = max_epochs + 1
 
     for epoch in range(start_epoch, max_epochs + 1):
         batches = deterministic_batch_indices(
@@ -1962,6 +2161,15 @@ def _track_a_corrected_fit_no_scaler(
             no_improvement = 0
         else:
             no_improvement += 1
+        history.append(
+            {
+                "epoch": epoch,
+                "validation_auroc": epoch_auroc,
+                "validation_auprc": epoch_auprc,
+                "improved": improved,
+                "no_improvement": no_improvement,
+            }
+        )
         if best_state is None:
             raise RuntimeError("corrected Track A training produced no state")
         payload = {
@@ -1976,8 +2184,10 @@ def _track_a_corrected_fit_no_scaler(
             "best_auprc": best_auprc,
             "best_state": best_state,
             "no_improvement": no_improvement,
+            "history": history,
             "rng_state": _rng_state(),
             "balancing_audit": balanced.audit,
+            "execution_backend": execution_backend,
         }
         _publish_checkpoint_generation(
             payload,
@@ -2005,6 +2215,8 @@ def _track_a_corrected_fit_no_scaler(
             "best_auroc": best_auroc,
             "best_auprc": best_auprc,
             "balancing_audit": balanced.audit,
+            "execution_backend": execution_backend,
+            "history": history,
         },
         checkpoint_dir,
         role="best_inference",
@@ -2025,6 +2237,7 @@ def _track_a_corrected_fit_no_scaler(
         checkpoint_path=inference.path,
         checkpoint_sha256=str(inference.descriptor["sha256"]),
         balancing_audit=balanced.audit,
+        history=tuple(copy.deepcopy(history)),
     )
 
 
@@ -2068,7 +2281,9 @@ def _track_a_prediction_frame(
     test_indices: np.ndarray,
     covid_labels: np.ndarray,
     covid_probability: np.ndarray,
+    predicted_label: np.ndarray,
     threshold: float,
+    threshold_comparator: str,
     threshold_source: str,
     configuration_sha256: str,
     split_sha256: str,
@@ -2078,6 +2293,7 @@ def _track_a_prediction_frame(
     checkpoint_sha: str,
     author_commit: str,
     code_revision: str,
+    execution_backend: str,
 ) -> pd.DataFrame:
     analysis_ids = [f"author-sample-{index:04d}" for index in test_indices]
     rows = {
@@ -2094,7 +2310,9 @@ def _track_a_prediction_frame(
         "recording_id": analysis_ids,
         "label_binary": covid_labels.astype(np.int64),
         "probability": covid_probability.astype(np.float64),
+        "predicted_label": predicted_label.astype(np.int64),
         "threshold": threshold,
+        "threshold_comparator": threshold_comparator,
         "threshold_source": threshold_source,
         "configuration_sha256": configuration_sha256,
         "split_sha256": split_sha256,
@@ -2107,6 +2325,7 @@ def _track_a_prediction_frame(
         "feature_indices_sha256": feature_indices_sha256,
         "feature_cache_key": feature_cache_key,
         "code_revision": code_revision,
+        "execution_backend": execution_backend,
     }
     return pd.DataFrame(rows, columns=list(PREDICTION_COLUMNS) + list(_TRACK_A_COLUMNS))
 
@@ -2151,7 +2370,7 @@ def _track_a_metric_row(
     probabilities = frame["probability"].to_numpy(dtype=np.float64)
     threshold = float(frame["threshold"].iloc[0])
     metrics = binary_metric_bundle(labels, probabilities, threshold=threshold)
-    predicted = (probabilities >= threshold).astype(np.int64)
+    predicted = frame["predicted_label"].to_numpy(dtype=np.int64)
     tn, fp, fn, tp = confusion_matrix(labels, predicted, labels=[0, 1]).ravel()
     if confusion_override is not None:
         tn = int(confusion_override["tn"])
@@ -2177,6 +2396,7 @@ def _track_a_metric_row(
         "paper_thresholded_auc": paper_thresholded_auc,
         "author_threshold": author_threshold,
         "threshold_source": str(frame["threshold_source"].iloc[0]),
+        "threshold_comparator": str(frame["threshold_comparator"].iloc[0]),
         "threshold_selected_on_outer_test": mode == "author_behaviour_audit",
         "model_reinitialized_per_fold": model_reinitialized,
         "optimizer_reinitialized_per_fold": model_reinitialized,
@@ -2206,6 +2426,7 @@ def _track_a_metric_row(
         "fold_sha256": fold_hash,
         "author_commit": author_commit,
         "code_revision": code_revision,
+        "execution_backend": str(frame["execution_backend"].iloc[0]),
         "global_feature_selection_retained": True,
         "released_preprocessed_array_retained": True,
         "external_standard_scaler": False,
@@ -2242,7 +2463,9 @@ def _track_a_receipt_identity(
         "configuration_sha256": context.configuration_sha256,
         "split_sha256": context.split_sha256,
         "code_revision": context.code_revision,
+        "execution_backend": context.execution_backend,
         "threshold_source": context.threshold_source,
+        "threshold_comparator": context.threshold_comparator,
         "predictions_path": "predictions.csv",
         "metrics_path": "metrics.json",
         "checkpoint_path": _track_a_relative_artifact_path(
@@ -2280,7 +2503,9 @@ def _require_track_a_prediction_identity(
         "feature_indices_sha256": context.feature_indices_sha256,
         "feature_cache_key": context.feature_cache_key,
         "code_revision": context.code_revision,
+        "execution_backend": context.execution_backend,
         "checkpoint_sha256": context.checkpoint_sha256,
+        "threshold_comparator": context.threshold_comparator,
     }
     if predictions.empty:
         raise ValueError("authenticated fold predictions cannot be empty")
@@ -2309,7 +2534,9 @@ def _require_track_a_metric_identity(
         "configuration_sha256": context.configuration_sha256,
         "split_sha256": context.split_sha256,
         "code_revision": context.code_revision,
+        "execution_backend": context.execution_backend,
         "threshold_source": context.threshold_source,
+        "threshold_comparator": context.threshold_comparator,
         "checkpoint_sha256": context.checkpoint_sha256,
         "global_feature_selection_retained": True,
         "released_preprocessed_array_retained": True,
@@ -2433,6 +2660,68 @@ def _track_a_author_split_sha256(
     )
 
 
+def _track_a_corrected_split(
+    artifacts: AuthorTrackAArtifacts,
+    fold: int,
+    reconstruction_seed: int,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    outer_train = artifacts.train_folds[fold]
+    inner_train, inner_validation = train_test_split(
+        outer_train,
+        test_size=0.125,
+        random_state=reconstruction_seed + fold,
+        stratify=artifacts.author_labels[outer_train],
+    )
+    split_sha = _canonical_sha256(
+        {
+            "fold": fold,
+            "outer_train": outer_train.tolist(),
+            "inner_train": np.asarray(inner_train).tolist(),
+            "inner_validation": np.asarray(inner_validation).tolist(),
+            "outer_test_hash": artifacts.fold_hashes.get(
+                f"Train-Test Split/coswaradataset/test/{fold}.csv",
+                _canonical_sha256(artifacts.test_folds[fold].tolist()),
+            ),
+        }
+    )
+    return (
+        np.asarray(inner_train, dtype=np.int64),
+        np.asarray(inner_validation, dtype=np.int64),
+        split_sha,
+    )
+
+
+def _track_a_mode_configuration(
+    *,
+    mode: str,
+    model_name: str,
+    model_config: ModelConfig,
+    published: Mapping[str, object],
+    patience: int,
+    reconstruction_seed: int,
+    feature_cache_key: str,
+    code_revision: str,
+    execution_backend: str,
+) -> dict[str, object]:
+    return {
+        "mode": mode,
+        "model_name": model_name,
+        "model_config": asdict(model_config),
+        "published": dict(published),
+        "patience": patience,
+        "reconstruction_seed": reconstruction_seed,
+        "author_training_order": (
+            "no_shuffle_repeated_dataset"
+            if mode == "author_behaviour_audit"
+            else "deterministic_per_epoch_shuffle"
+        ),
+        "author_randomness_unseeded": True,
+        "feature_cache_key": feature_cache_key,
+        "code_revision": code_revision,
+        "execution_backend": execution_backend,
+    }
+
+
 def _resolve_track_a_fold_inference(fold_dir: Path) -> ResolvedCheckpoint:
     try:
         return _resolve_checkpoint_manifest(
@@ -2455,6 +2744,7 @@ def _track_a_author_fold_context(
     configuration_sha256: str,
     code_revision: str,
     reconstruction_seed: int,
+    execution_backend: str,
 ) -> TrackAFoldContext:
     fold_dir = (
         run_dir
@@ -2476,7 +2766,9 @@ def _track_a_author_fold_context(
         configuration_sha256=configuration_sha256,
         split_sha256=_track_a_author_split_sha256(artifacts, fold),
         code_revision=code_revision,
+        execution_backend=execution_backend,
         threshold_source="test_balanced_accuracy_author_audit",
+        threshold_comparator="gt",
         reconstruction_seed=reconstruction_seed,
         checkpoint_path=inference.path,
         checkpoint_sha256=str(inference.descriptor["sha256"]),
@@ -2515,6 +2807,7 @@ def _validate_track_a_author_receipt_chain(
     configuration_sha256: str,
     code_revision: str,
     reconstruction_seed: int,
+    execution_backend: str,
     state: Mapping[str, object],
 ) -> tuple[dict[int, tuple[pd.DataFrame, dict[str, object]]], dict[str, object]]:
     completed: dict[int, tuple[pd.DataFrame, dict[str, object]]] = {}
@@ -2538,6 +2831,7 @@ def _validate_track_a_author_receipt_chain(
                 configuration_sha256=configuration_sha256,
                 code_revision=code_revision,
                 reconstruction_seed=reconstruction_seed,
+                execution_backend=execution_backend,
             )
             loaded = _load_completed_track_a_fold(fold_dir, expected=context)
         except (FileNotFoundError, RuntimeError, ValueError) as exc:
@@ -2574,6 +2868,7 @@ def _publish_track_a_author_between_fold_state(
     fold_batch: Sequence[int],
     epochs_per_fold: int,
     receipt_binding: Mapping[str, object],
+    execution_backend: str,
 ) -> ResolvedCheckpoint:
     return _publish_checkpoint_generation(
         {
@@ -2587,6 +2882,7 @@ def _publish_track_a_author_between_fold_state(
             "phase": "between_folds",
             "fold_batch": list(fold_batch),
             "rng_state": _rng_state(),
+            "execution_backend": execution_backend,
             **receipt_binding,
         },
         state_dir,
@@ -2697,31 +2993,62 @@ def run_track_a(
     torch_device = torch.device(execution_backend)
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    configurations: dict[tuple[str, str], tuple[ModelConfig, str]] = {}
+    for selected_mode in requested_modes:
+        for selected_model in requested_models:
+            selected_model_config = _track_a_model_config(selected_model, published)
+            mode_configuration = _track_a_mode_configuration(
+                mode=selected_mode,
+                model_name=selected_model,
+                model_config=selected_model_config,
+                published=published,
+                patience=patience,
+                reconstruction_seed=reconstruction_seed,
+                feature_cache_key=feature_cache.cache_key,
+                code_revision=code_revision,
+                execution_backend=execution_backend,
+            )
+            configurations[(selected_mode, selected_model)] = (
+                selected_model_config,
+                _canonical_sha256(mode_configuration),
+            )
+    expected_folds = tuple(range(len(artifacts.test_folds)))
+    run_contract = {
+        "format_version": 1,
+        "run_id": run_id,
+        "track": "A",
+        "modes": list(requested_modes),
+        "model_names": list(requested_models),
+        "expected_folds": list(expected_folds),
+        "author_commit": artifacts.author_commit,
+        "feature_cache_key": feature_cache.cache_key,
+        "code_revision": code_revision,
+        "execution_backend": execution_backend,
+        "configuration_sha256": {
+            f"{mode}/{model}": configurations[(mode, model)][1]
+            for mode in requested_modes
+            for model in requested_models
+        },
+    }
+    contract_path = run_dir / "track_a_run_contract.json"
+    if contract_path.is_file():
+        try:
+            existing_contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("Track A run contract cannot be authenticated") from exc
+        if existing_contract != run_contract:
+            raise ValueError("Track A run contract mismatch")
+    else:
+        _atomic_json_write(run_contract, contract_path)
+
     all_predictions: list[pd.DataFrame] = []
     all_metrics: list[dict[str, object]] = []
-    total_units = len(requested_modes) * len(requested_models) * len(folds)
+    total_units = len(requested_modes) * len(requested_models) * len(expected_folds)
     completed_units = 0
 
     for mode in requested_modes:
         for model_name in requested_models:
-            model_config = _track_a_model_config(model_name, published)
-            mode_config = {
-                "mode": mode,
-                "model_name": model_name,
-                "model_config": asdict(model_config),
-                "published": published,
-                "patience": patience,
-                "reconstruction_seed": reconstruction_seed,
-                "author_training_order": (
-                    "no_shuffle_repeated_dataset"
-                    if mode == "author_behaviour_audit"
-                    else "deterministic_per_epoch_shuffle"
-                ),
-                "author_randomness_unseeded": True,
-                "feature_cache_key": feature_cache.cache_key,
-                "code_revision": code_revision,
-            }
-            configuration_sha = _canonical_sha256(mode_config)
+            model_config, configuration_sha = configurations[(mode, model_name)]
             state_dir = run_dir / "track_a" / mode / model_name / "state"
 
             if mode == "author_behaviour_audit":
@@ -2742,6 +3069,12 @@ def run_track_a(
                         state_dir, role="latest_recovery", map_location="cpu"
                     )
                     state = recovered.payload
+                    if state.get("execution_backend") != execution_backend:
+                        raise ValueError(
+                            "execution_backend mismatch: checkpoint="
+                            f"{state.get('execution_backend')!r}, "
+                            f"requested={execution_backend!r}"
+                        )
                     if state.get("track_a_configuration_sha256") != configuration_sha:
                         raise ValueError("author Track A resume configuration mismatch")
                     model.load_state_dict(state["model_state"])  # type: ignore[arg-type]
@@ -2775,6 +3108,7 @@ def run_track_a(
                         configuration_sha256=configuration_sha,
                         code_revision=code_revision,
                         reconstruction_seed=reconstruction_seed,
+                        execution_backend=execution_backend,
                         state=state,
                     )
                 )
@@ -2802,6 +3136,7 @@ def run_track_a(
                             configuration_sha256=configuration_sha,
                             code_revision=code_revision,
                             reconstruction_seed=reconstruction_seed,
+                            execution_backend=execution_backend,
                         )
                         completed_output = _load_completed_track_a_fold(
                             completed_fold_dir,
@@ -2825,6 +3160,7 @@ def run_track_a(
                             fold_batch=folds,
                             epochs_per_fold=int(published["epochs"]),
                             receipt_binding=completed_receipt_binding,
+                            execution_backend=execution_backend,
                         )
                         completed_prior[completed_fold] = completed_output
                         preceding_receipt_binding = completed_receipt_binding
@@ -2880,6 +3216,7 @@ def run_track_a(
                                 "rng_state": _rng_state(),
                                 "fold_seed": fold_seed,
                                 "balancing_audit": balanced.audit,
+                                "execution_backend": execution_backend,
                                 **preceding_receipt_binding,
                             },
                             state_dir,
@@ -2920,6 +3257,7 @@ def run_track_a(
                             "model_state": model.state_dict(),
                             "fold": fold,
                             "split_sha256": split_sha,
+                            "execution_backend": execution_backend,
                         },
                         fold_dir / "checkpoints",
                         role="best_inference",
@@ -2934,7 +3272,11 @@ def run_track_a(
                         test_indices=test_indices,
                         covid_labels=artifacts.covid_labels[test_indices],
                         covid_probability=covid_probability,
+                        predicted_label=np.asarray(
+                            threshold_audit["covid_prediction"], dtype=np.int64
+                        ),
                         threshold=public_threshold,
+                        threshold_comparator="gt",
                         threshold_source="test_balanced_accuracy_author_audit",
                         configuration_sha256=configuration_sha,
                         split_sha256=split_sha,
@@ -2944,6 +3286,7 @@ def run_track_a(
                         checkpoint_sha=str(fold_inference.descriptor["sha256"]),
                         author_commit=artifacts.author_commit,
                         code_revision=code_revision,
+                        execution_backend=execution_backend,
                     )
                     metric = _track_a_metric_row(
                         frame=predictions,
@@ -2977,7 +3320,9 @@ def run_track_a(
                         configuration_sha256=configuration_sha,
                         split_sha256=split_sha,
                         code_revision=code_revision,
+                        execution_backend=execution_backend,
                         threshold_source="test_balanced_accuracy_author_audit",
+                        threshold_comparator="gt",
                         reconstruction_seed=reconstruction_seed,
                         checkpoint_path=fold_inference.path,
                         checkpoint_sha256=str(fold_inference.descriptor["sha256"]),
@@ -3009,6 +3354,7 @@ def run_track_a(
                         fold_batch=folds,
                         epochs_per_fold=int(published["epochs"]),
                         receipt_binding=completed_receipt_binding,
+                        execution_backend=execution_backend,
                     )
                     next_fold = fold + 1
                     resume_epoch = 0
@@ -3021,24 +3367,12 @@ def run_track_a(
             else:
                 for fold in folds:
                     fold_dir = run_dir / "track_a" / mode / model_name / f"fold_{fold:02d}"
-                    outer_train = artifacts.train_folds[fold]
-                    inner_train, inner_validation = train_test_split(
-                        outer_train,
-                        test_size=0.125,
-                        random_state=reconstruction_seed + fold,
-                        stratify=artifacts.author_labels[outer_train],
-                    )
-                    split_sha = _canonical_sha256(
-                        {
-                            "fold": fold,
-                            "outer_train": outer_train.tolist(),
-                            "inner_train": np.asarray(inner_train).tolist(),
-                            "inner_validation": np.asarray(inner_validation).tolist(),
-                            "outer_test_hash": artifacts.fold_hashes.get(
-                                f"Train-Test Split/coswaradataset/test/{fold}.csv",
-                                _canonical_sha256(artifacts.test_folds[fold].tolist()),
-                            ),
-                        }
+                    inner_train, inner_validation, split_sha = (
+                        _track_a_corrected_split(
+                            artifacts,
+                            fold,
+                            reconstruction_seed,
+                        )
                     )
                     completed = None
                     completion_files = tuple(
@@ -3068,7 +3402,9 @@ def run_track_a(
                             configuration_sha256=configuration_sha,
                             split_sha256=split_sha,
                             code_revision=code_revision,
+                            execution_backend=execution_backend,
                             threshold_source="inner_validation_balanced_accuracy",
+                            threshold_comparator="ge",
                             reconstruction_seed=reconstruction_seed + fold,
                             checkpoint_path=inference.path,
                             checkpoint_sha256=str(inference.descriptor["sha256"]),
@@ -3126,7 +3462,11 @@ def run_track_a(
                         test_indices=test_indices,
                         covid_labels=artifacts.covid_labels[test_indices],
                         covid_probability=1.0 - probability_n,
+                        predicted_label=(
+                            (1.0 - probability_n) >= fitted.threshold
+                        ).astype(np.int64),
                         threshold=fitted.threshold,
+                        threshold_comparator="ge",
                         threshold_source="inner_validation_balanced_accuracy",
                         configuration_sha256=configuration_sha,
                         split_sha256=split_sha,
@@ -3136,6 +3476,7 @@ def run_track_a(
                         checkpoint_sha=fitted.checkpoint_sha256,
                         author_commit=artifacts.author_commit,
                         code_revision=code_revision,
+                        execution_backend=execution_backend,
                     )
                     metric = _track_a_metric_row(
                         frame=predictions,
@@ -3169,7 +3510,9 @@ def run_track_a(
                         configuration_sha256=configuration_sha,
                         split_sha256=split_sha,
                         code_revision=code_revision,
+                        execution_backend=execution_backend,
                         threshold_source="inner_validation_balanced_accuracy",
+                        threshold_comparator="ge",
                         reconstruction_seed=reconstruction_seed + fold,
                         checkpoint_path=fitted.checkpoint_path,
                         checkpoint_sha256=fitted.checkpoint_sha256,
@@ -3195,8 +3538,93 @@ def run_track_a(
             }
             _atomic_json_write(progress, run_dir / "progress.json")
 
-    prediction_frame = pd.concat(all_predictions, ignore_index=True) if all_predictions else pd.DataFrame()
-    metric_frame = pd.DataFrame(all_metrics)
+    del all_predictions, all_metrics
+    authenticated_predictions: list[pd.DataFrame] = []
+    authenticated_metrics: list[dict[str, object]] = []
+    authenticated_receipts: list[dict[str, object]] = []
+    for mode in requested_modes:
+        for model_name in requested_models:
+            _, configuration_sha = configurations[(mode, model_name)]
+            for fold in expected_folds:
+                fold_dir = (
+                    run_dir / "track_a" / mode / model_name / f"fold_{fold:02d}"
+                )
+                completion_paths = tuple(
+                    fold_dir / name
+                    for name in ("receipt.json", "predictions.csv", "metrics.json")
+                )
+                if not any(path.exists() for path in completion_paths):
+                    continue
+                try:
+                    inference = _resolve_track_a_fold_inference(fold_dir)
+                    if mode == "author_behaviour_audit":
+                        split_sha = _track_a_author_split_sha256(artifacts, fold)
+                        fold_seed = reconstruction_seed
+                        comparator = "gt"
+                        threshold_source = "test_balanced_accuracy_author_audit"
+                    else:
+                        _, _, split_sha = _track_a_corrected_split(
+                            artifacts,
+                            fold,
+                            reconstruction_seed,
+                        )
+                        fold_seed = reconstruction_seed + fold
+                        comparator = "ge"
+                        threshold_source = "inner_validation_balanced_accuracy"
+                    context = TrackAFoldContext(
+                        run_id=run_id,
+                        mode=mode,
+                        fold=fold,
+                        model_name=model_name,
+                        author_commit=artifacts.author_commit,
+                        feature_sha256=feature_cache.selected_features_sha256,
+                        feature_indices_sha256=feature_cache.selected_indices_sha256,
+                        feature_cache_key=feature_cache.cache_key,
+                        configuration_sha256=configuration_sha,
+                        split_sha256=split_sha,
+                        code_revision=code_revision,
+                        execution_backend=execution_backend,
+                        threshold_source=threshold_source,
+                        threshold_comparator=comparator,
+                        reconstruction_seed=fold_seed,
+                        checkpoint_path=inference.path,
+                        checkpoint_sha256=str(inference.descriptor["sha256"]),
+                    )
+                    completed = _load_completed_track_a_fold(
+                        fold_dir,
+                        expected=context,
+                    )
+                except (FileNotFoundError, RuntimeError, ValueError) as exc:
+                    raise ValueError(
+                        "authenticated fold aggregation encountered an invalid prior output"
+                    ) from exc
+                if completed is None:
+                    raise ValueError(
+                        "authenticated fold aggregation encountered an incomplete output"
+                    )
+                predictions, metric = completed
+                authenticated_predictions.append(predictions)
+                authenticated_metrics.append(metric)
+                receipt_path = fold_dir / "receipt.json"
+                authenticated_receipts.append(
+                    {
+                        "mode": mode,
+                        "model_name": model_name,
+                        "fold": fold,
+                        "path": _track_a_relative_artifact_path(
+                            receipt_path,
+                            run_dir,
+                        ),
+                        "sha256": checkpoint_sha256(receipt_path),
+                    }
+                )
+
+    prediction_frame = (
+        pd.concat(authenticated_predictions, ignore_index=True)
+        if authenticated_predictions
+        else pd.DataFrame()
+    )
+    metric_frame = pd.DataFrame(authenticated_metrics)
     if not prediction_frame.empty:
         write_predictions(prediction_frame, run_dir / "track_a_predictions.csv")
     if not metric_frame.empty:
@@ -3206,12 +3634,15 @@ def run_track_a(
                 "balancing_audit"
             ].map(lambda value: json.dumps(value, sort_keys=True))
         _atomic_dataframe_write(serializable_metrics, run_dir / "track_a_metrics.csv")
+    completed_units = len(authenticated_metrics)
+    final_status = "complete" if completed_units == total_units else "partial"
     final = {
-        "status": "complete",
+        "status": final_status,
         "run_id": run_id,
         "completed_units": completed_units,
         "total_units": total_units,
         "fold_batch": list(folds),
+        "expected_folds": list(expected_folds),
         "modes": list(requested_modes),
         "model_names": list(requested_models),
         "author_commit": artifacts.author_commit,
@@ -3219,13 +3650,16 @@ def run_track_a(
         "author_training_order": "no_shuffle_repeated_dataset",
         "author_randomness_unseeded": True,
         "reconstruction_seed": reconstruction_seed,
+        "execution_backend": execution_backend,
+        "authenticated_receipts": authenticated_receipts,
         "metrics": metric_frame.to_dict(orient="records"),
         "predictions": prediction_frame.to_dict(orient="records"),
     }
-    _atomic_json_write(
-        {key: value for key, value in final.items() if key not in {"metrics", "predictions"}},
-        run_dir / "progress.json",
-    )
+    persisted_final = {
+        key: value for key, value in final.items() if key not in {"metrics", "predictions"}
+    }
+    _atomic_json_write(persisted_final, run_dir / "progress.json")
+    _atomic_json_write(persisted_final, run_dir / "track_a_manifest.json")
     return final
 
 
@@ -3331,6 +3765,25 @@ def validate_prediction_frame(predictions: pd.DataFrame) -> pd.DataFrame:
         )
         if missing_analysis.any():
             raise ValueError("Track A analysis_id must be present")
+        comparators = predictions["threshold_comparator"].astype(str)
+        if not comparators.isin(["gt", "ge"]).all():
+            raise ValueError("Track A threshold_comparator must be 'gt' or 'ge'")
+        if not predictions["predicted_label"].isin([0, 1]).all():
+            raise ValueError("Track A predicted_label must contain binary labels")
+        expected_prediction = np.where(
+            comparators.to_numpy() == "gt",
+            predictions["probability"].to_numpy(dtype=np.float64)
+            > predictions["threshold"].to_numpy(dtype=np.float64),
+            predictions["probability"].to_numpy(dtype=np.float64)
+            >= predictions["threshold"].to_numpy(dtype=np.float64),
+        ).astype(np.int64)
+        if not np.array_equal(
+            predictions["predicted_label"].to_numpy(dtype=np.int64),
+            expected_prediction,
+        ):
+            raise ValueError(
+                "Track A predicted_label does not match threshold_comparator semantics"
+            )
     else:
         missing_participant = predictions["participant_id"].isna() | (
             predictions["participant_id"].astype(str).str.strip().eq("")

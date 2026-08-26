@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import inspect
 import json
 import math
+import os
 import shutil
+import threading
+import time
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -21,7 +25,10 @@ from covid_rars.dndt_dndf_experiment import (
     PlannedInterruption,
     TrackAFeatureCache,
     TrainConfig,
+    _predict_probabilities,
+    _track_a_corrected_fit_no_scaler,
     _atomic_torch_save,
+    _exclusive_rfecv_cache_lock,
     _manifest_path,
     _publish_checkpoint_generation,
     _resolve_checkpoint_manifest,
@@ -42,6 +49,19 @@ from covid_rars.dndt_dndf_experiment import (
     write_predictions,
 )
 from covid_rars.dndt_dndf_models import ModelConfig
+
+
+def _malicious_checkpoint_side_effect(path: str) -> dict[str, object]:
+    Path(path).write_text("executed", encoding="utf-8")
+    return {}
+
+
+class _MaliciousCheckpointValue:
+    def __init__(self, marker: Path) -> None:
+        self.marker = marker
+
+    def __reduce__(self) -> tuple[object, tuple[str]]:
+        return _malicious_checkpoint_side_effect, (str(self.marker),)
 
 
 def _sha(value: str) -> str:
@@ -487,11 +507,13 @@ def test_manifest_resolution_falls_back_without_deserializing_invalid_current(
         second.path.unlink()
 
     real_load = torch.load
-    loaded_paths: list[Path] = []
+    loaded_digests: list[str] = []
 
-    def observe_load(path: Path, *args: object, **kwargs: object):
-        loaded_paths.append(Path(path))
-        return real_load(path, *args, **kwargs)
+    def observe_load(source: object, *args: object, **kwargs: object):
+        assert isinstance(source, io.BytesIO)
+        loaded_digests.append(hashlib.sha256(source.getvalue()).hexdigest())
+        assert kwargs["weights_only"] is True
+        return real_load(source, *args, **kwargs)
 
     monkeypatch.setattr(torch, "load", observe_load)
     resolved = _resolve_checkpoint_manifest(
@@ -501,7 +523,82 @@ def test_manifest_resolution_falls_back_without_deserializing_invalid_current(
     assert resolved.used_fallback is True
     assert resolved.path == first.path
     assert resolved.payload["marker"] == 1
-    assert loaded_paths == [first.path]
+    assert loaded_digests == [first.descriptor["sha256"]]
+
+
+def test_checkpoint_loader_rejects_unsupported_pickle_without_execution(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "pickle-executed.txt"
+    stream = io.BytesIO()
+    torch.save(
+        {
+            "checkpoint_role": "latest_recovery",
+            "unsafe": _MaliciousCheckpointValue(marker),
+        },
+        stream,
+    )
+    checkpoint_bytes = stream.getvalue()
+    digest = hashlib.sha256(checkpoint_bytes).hexdigest()
+    filename = f"latest_recovery-g000001-e000001-{digest}.pt"
+    (tmp_path / filename).write_bytes(checkpoint_bytes)
+    (tmp_path / "latest_recovery.manifest.json").write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "role": "latest_recovery",
+                "current": {
+                    "filename": filename,
+                    "sha256": digest,
+                    "epoch": 1,
+                    "generation": 1,
+                    "kind": "recovery",
+                },
+                "previous": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="deserialization failed"):
+        _resolve_checkpoint_manifest(
+            tmp_path,
+            role="latest_recovery",
+            map_location="cpu",
+        )
+
+    assert not marker.exists()
+
+
+def test_checkpoint_loader_deserializes_the_same_verified_immutable_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    published = _publish_checkpoint_generation(
+        {"marker": "verified"},
+        tmp_path,
+        role="latest_recovery",
+        epoch=1,
+    )
+    real_load = torch.load
+    observed: list[tuple[object, bool | None]] = []
+
+    def replace_path_after_read(source: object, *args: object, **kwargs: object):
+        observed.append((source, kwargs.get("weights_only")))
+        published.path.write_bytes(b"replacement after immutable read")
+        return real_load(source, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", replace_path_after_read)
+    resolved = _resolve_checkpoint_manifest(
+        tmp_path,
+        role="latest_recovery",
+        map_location="cpu",
+    )
+
+    assert resolved.payload["marker"] == "verified"
+    assert len(observed) == 1
+    assert isinstance(observed[0][0], io.BytesIO)
+    assert observed[0][1] is True
 
 
 def test_manifest_descriptor_must_match_immutable_generation_identity(
@@ -864,6 +961,9 @@ def _prediction_frame(track: str = "B") -> pd.DataFrame:
             "feature_indices_sha256": "f" * 64,
             "feature_cache_key": "0" * 64,
             "code_revision": "task4-test-revision",
+            "execution_backend": "cpu",
+            "predicted_label": 1,
+            "threshold_comparator": "ge",
         }
         row.update(track_a_provenance)
         columns.extend(track_a_provenance)
@@ -877,6 +977,15 @@ def test_prediction_schema_and_provenance_are_exact(tmp_path: Path) -> None:
 
     track_a = validate_prediction_frame(_prediction_frame("A"))
     assert track_a.loc[0, "analysis_unit"] == "author_sample"
+    strict_boundary = _prediction_frame("A").assign(
+        probability=0.5,
+        threshold=0.5,
+        threshold_comparator="gt",
+        predicted_label=0,
+    )
+    validate_prediction_frame(strict_boundary)
+    with pytest.raises(ValueError, match="threshold_comparator semantics"):
+        validate_prediction_frame(strict_boundary.assign(predicted_label=1))
 
     with pytest.raises(ValueError, match="columns"):
         validate_prediction_frame(frame.assign(unexpected="x"))
@@ -1071,8 +1180,31 @@ def test_author_threshold_sweep_matches_independent_oracle_and_covid_confusion()
     assert audit["tp"] == int(tp)
     converted = author_threshold_to_covid_threshold(float(audit["author_threshold"]))
     np.testing.assert_array_equal(
-        (1.0 - probability_n >= converted).astype(int),
+        (1.0 - probability_n > converted).astype(int),
         predicted_covid,
+    )
+
+
+@pytest.mark.parametrize(
+    ("author_threshold", "probability_n"),
+    (
+        (0.0, np.array([0.0, 0.4, 1.0], dtype=np.float64)),
+        (0.999, np.array([0.998, 0.999, 1.0], dtype=np.float64)),
+        (0.4, np.array([0.399, 0.4, 0.401], dtype=np.float64)),
+    ),
+)
+def test_author_threshold_conversion_preserves_strict_covid_boundary_semantics(
+    author_threshold: float,
+    probability_n: np.ndarray,
+) -> None:
+    covid_threshold = author_threshold_to_covid_threshold(author_threshold)
+    probability_covid = 1.0 - probability_n
+    expected = 1 - (probability_n >= author_threshold).astype(np.int64)
+
+    assert covid_threshold == pytest.approx(1.0 - author_threshold)
+    np.testing.assert_array_equal(
+        (probability_covid > covid_threshold).astype(np.int64),
+        expected,
     )
 
 
@@ -1208,6 +1340,121 @@ def test_rfecv_cache_rejects_every_provenance_or_byte_corruption(
     assert "unexpected" not in repaired_manifest
 
 
+def test_rfecv_cache_concurrent_build_publishes_once_without_partial_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import covid_rars.dndt_dndf_experiment as experiment
+
+    artifacts = _tiny_track_a_artifacts()
+    barrier = threading.Barrier(2)
+    calls: list[int] = []
+    calls_lock = threading.Lock()
+
+    class SlowRfecv:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def fit(self, features: np.ndarray, labels: np.ndarray) -> SlowRfecv:
+            del labels
+            with calls_lock:
+                calls.append(features.shape[0])
+            time.sleep(0.15)
+            self.support_ = np.array([True, False, True, False, True, False])
+            return self
+
+    monkeypatch.setattr(experiment, "RFECV", SlowRfecv)
+    results: list[TrackAFeatureCache] = []
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            barrier.wait(timeout=5)
+            results.append(
+                prepare_track_a_rfecv_cache(
+                    artifacts,
+                    tmp_path,
+                    expected_indices=np.array([0, 2, 4]),
+                )
+            )
+        except BaseException as exc:  # pragma: no branch - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    assert calls == [48]
+    assert len(results) == 2
+    assert results[0].cache_key == results[1].cache_key
+    np.testing.assert_array_equal(
+        results[0].selected_features,
+        results[1].selected_features,
+    )
+    cache_dir = results[0].manifest_path.parent
+    assert not list(cache_dir.glob("*.tmp"))
+    assert not (cache_dir / ".rfecv-cache.lock").exists()
+
+
+def test_rfecv_lock_recovers_stale_dead_owner_and_times_out_for_live_owner(
+    tmp_path: Path,
+) -> None:
+    lock_path = tmp_path / ".rfecv-cache.lock"
+    lock_path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "token": "dead",
+                "pid": 2_147_483_000,
+                "hostname": __import__("socket").gethostname(),
+                "created_at": time.time(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    with _exclusive_rfecv_cache_lock(
+        lock_path,
+        timeout=0.5,
+        stale_after=60.0,
+    ):
+        assert lock_path.is_file()
+    assert not lock_path.exists()
+
+    lock_path.write_text("[]\n", encoding="utf-8")
+    os.utime(lock_path, (1.0, 1.0))
+    with _exclusive_rfecv_cache_lock(
+        lock_path,
+        timeout=0.5,
+        stale_after=0.0,
+    ):
+        assert lock_path.is_file()
+    assert not lock_path.exists()
+
+    lock_path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "token": "live",
+                "pid": __import__("os").getpid(),
+                "hostname": __import__("socket").gethostname(),
+                "created_at": time.time(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(TimeoutError, match="RFECV cache lock"):
+        with _exclusive_rfecv_cache_lock(
+            lock_path,
+            timeout=0.05,
+            stale_after=60.0,
+        ):
+            raise AssertionError("live lock must not be acquired")
+
+
 def test_rfecv_expected_index_assertion_rejects_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1308,6 +1555,209 @@ def test_track_a_modes_record_identity_threshold_and_training_order_contracts(
     assert corrected["threshold_selected_on_outer_test"].eq(False).all()
     assert corrected["model_reinitialized_per_fold"].eq(True).all()
     assert corrected["outer_test_evaluation_count"].eq(1).all()
+    predictions = pd.DataFrame(result["predictions"])
+    author_predictions = predictions[
+        predictions["mode"] == "author_behaviour_audit"
+    ]
+    corrected_predictions = predictions[
+        predictions["mode"] == "corrected_reference"
+    ]
+    assert author_predictions["threshold_comparator"].eq("gt").all()
+    assert corrected_predictions["threshold_comparator"].eq("ge").all()
+    assert predictions["execution_backend"].eq("cpu").all()
+    assert rows["execution_backend"].eq("cpu").all()
+    run_dir = tmp_path / "runs" / "identity-contract"
+    for receipt_path in run_dir.rglob("receipt.json"):
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        assert receipt["execution_backend"] == "cpu"
+    author_state = _resolve_checkpoint_manifest(
+        run_dir / "track_a" / "author_behaviour_audit" / "dndt" / "state",
+        role="latest_recovery",
+        map_location="cpu",
+    )
+    assert author_state.payload["execution_backend"] == "cpu"
+    for checkpoint_dir in run_dir.glob("track_a/*/dndt/fold_*/checkpoints"):
+        inference = _resolve_checkpoint_manifest(
+            checkpoint_dir,
+            role="best_inference",
+            map_location="cpu",
+        )
+        assert inference.payload["execution_backend"] == "cpu"
+    np.testing.assert_array_equal(
+        author_predictions["predicted_label"].to_numpy(dtype=np.int64),
+        (
+            author_predictions["probability"].to_numpy(dtype=np.float64)
+            > author_predictions["threshold"].to_numpy(dtype=np.float64)
+        ).astype(np.int64),
+    )
+    np.testing.assert_array_equal(
+        corrected_predictions["predicted_label"].to_numpy(dtype=np.int64),
+        (
+            corrected_predictions["probability"].to_numpy(dtype=np.float64)
+            >= corrected_predictions["threshold"].to_numpy(dtype=np.float64)
+        ).astype(np.int64),
+    )
+
+
+def test_track_a_resume_rejects_backend_mismatch_before_optimizer_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = _tiny_track_a_artifacts()
+    cache = _tiny_track_a_cache(tmp_path)
+    config = _tiny_track_a_config(tmp_path)
+    common = {
+        "run_id": "backend-binding",
+        "artifacts": artifacts,
+        "feature_cache": cache,
+        "fold_batch": (0,),
+        "modes": ("corrected_reference",),
+        "model_names": ("dndt",),
+        "code_revision": "task4-backend-test",
+        "device": "cpu",
+    }
+    with pytest.raises(PlannedInterruption):
+        run_track_a(
+            config,
+            interrupt_after=("corrected_reference", "dndt", 0, 1),
+            **common,
+        )
+    state_dir = (
+        tmp_path
+        / "runs"
+        / "backend-binding"
+        / "track_a"
+        / "corrected_reference"
+        / "dndt"
+        / "fold_00"
+        / "checkpoints"
+    )
+    recovered = _resolve_checkpoint_manifest(
+        state_dir,
+        role="latest_recovery",
+        map_location="cpu",
+    )
+    assert recovered.payload["execution_backend"] == "cpu"
+    tampered = dict(recovered.payload)
+    fingerprint = dict(tampered["track_a_fingerprint"])
+    fingerprint["execution_backend"] = "cuda:0"
+    tampered["track_a_fingerprint"] = fingerprint
+    tampered["execution_backend"] = "cuda:0"
+    _publish_checkpoint_generation(
+        tampered,
+        state_dir,
+        role="latest_recovery",
+        epoch=int(tampered["completed_epoch"]),
+    )
+
+    def forbidden_optimizer_restore(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("optimizer state loaded before backend validation")
+
+    monkeypatch.setattr(
+        torch.optim.Adam,
+        "load_state_dict",
+        forbidden_optimizer_restore,
+    )
+    with pytest.raises(ValueError, match="execution_backend.*mismatch"):
+        run_track_a(config, resume=True, **common)
+
+
+def test_corrected_resume_at_patience_exhaustion_runs_no_additional_epoch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import covid_rars.dndt_dndf_experiment as experiment
+
+    artifacts = _tiny_track_a_artifacts()
+    training = artifacts.train_folds[0]
+    validation = artifacts.test_folds[0]
+    calls = {"full": 0, "resumed": 0}
+    active = "full"
+    original_train_epoch = experiment._track_a_train_epoch
+
+    def count_epoch(*args: object, **kwargs: object) -> None:
+        calls[active] += 1
+        original_train_epoch(*args, **kwargs)
+
+    monkeypatch.setattr(experiment, "_track_a_train_epoch", count_epoch)
+    monkeypatch.setattr(
+        experiment,
+        "_safe_validation_metrics",
+        lambda *_args: (0.5, 0.5),
+    )
+    common = {
+        "model_config": _model_config(),
+        "learning_rate": 0.01,
+        "batch_size": 8,
+        "max_epochs": 5,
+        "patience": 1,
+        "reconstruction_seed": 42,
+        "feature_sha256": _sha("track-a-features"),
+        "split_sha256": _sha("track-a-split"),
+        "code_revision": "task4-patience-test",
+        "device": torch.device("cpu"),
+        "mode": "corrected_reference",
+        "fold": 0,
+    }
+    full = _track_a_corrected_fit_no_scaler(
+        artifacts.features[training],
+        artifacts.author_labels[training],
+        artifacts.features[validation],
+        artifacts.covid_labels[validation],
+        checkpoint_dir=tmp_path / "full",
+        resume=False,
+        interrupt_after_epoch=None,
+        **common,
+    )
+    assert calls["full"] == 2
+
+    active = "resumed"
+    with pytest.raises(PlannedInterruption):
+        _track_a_corrected_fit_no_scaler(
+            artifacts.features[training],
+            artifacts.author_labels[training],
+            artifacts.features[validation],
+            artifacts.covid_labels[validation],
+            checkpoint_dir=tmp_path / "resumed",
+            resume=False,
+            interrupt_after_epoch=2,
+            **common,
+        )
+    assert calls["resumed"] == 2
+    resumed = _track_a_corrected_fit_no_scaler(
+        artifacts.features[training],
+        artifacts.author_labels[training],
+        artifacts.features[validation],
+        artifacts.covid_labels[validation],
+        checkpoint_dir=tmp_path / "resumed",
+        resume=True,
+        interrupt_after_epoch=None,
+        **common,
+    )
+
+    assert calls["resumed"] == 2
+    assert resumed.best_epoch == full.best_epoch == 1
+    assert resumed.history == full.history
+    full_probability = _predict_probabilities(
+        full.model,
+        artifacts.features[validation],
+        device=torch.device("cpu"),
+        batch_size=8,
+    )
+    resumed_probability = _predict_probabilities(
+        resumed.model,
+        artifacts.features[validation],
+        device=torch.device("cpu"),
+        batch_size=8,
+    )
+    np.testing.assert_allclose(resumed_probability, full_probability, rtol=0.0, atol=0.0)
+    latest = _resolve_checkpoint_manifest(
+        tmp_path / "resumed",
+        role="latest_recovery",
+        map_location="cpu",
+    )
+    assert latest.payload["completed_epoch"] == 2
+    assert latest.payload["no_improvement"] == 1
 
 
 def test_author_fold_batch_resume_matches_uninterrupted_and_writes_atomic_receipts(
@@ -1531,7 +1981,9 @@ def test_track_a_predictions_carry_complete_fold_provenance(tmp_path: Path) -> N
         "configuration_sha256",
         "split_sha256",
         "code_revision",
+        "execution_backend",
         "threshold_source",
+        "threshold_comparator",
         "predictions_path",
         "metrics_path",
         "checkpoint_path",
@@ -1627,7 +2079,10 @@ def test_completed_fold_resume_rejects_nonexact_receipt_schema(
             "feature_indices_sha256",
             "feature_cache_key",
             "code_revision",
+            "execution_backend",
             "checkpoint_sha256",
+            "threshold_comparator",
+            "predicted_label",
         )),
         *(('metric', field) for field in (
             "run_id",
@@ -1643,7 +2098,9 @@ def test_completed_fold_resume_rejects_nonexact_receipt_schema(
             "configuration_sha256",
             "split_sha256",
             "code_revision",
+            "execution_backend",
             "threshold_source",
+            "threshold_comparator",
             "checkpoint_sha256",
         )),
     ),
@@ -1878,5 +2335,59 @@ def test_corrected_outer_test_is_touched_once_after_validation_freeze(
 
     assert len(calls) == 1
     np.testing.assert_array_equal(calls[0], artifacts.test_folds[0])
+
+
+def test_track_a_batched_aggregate_retains_all_authenticated_prior_folds(
+    tmp_path: Path,
+) -> None:
+    artifacts = _tiny_track_a_artifacts()
+    cache = _tiny_track_a_cache(tmp_path)
+    config = _tiny_track_a_config(tmp_path)
+    common = {
+        "run_id": "batched-aggregate",
+        "artifacts": artifacts,
+        "feature_cache": cache,
+        "modes": ("corrected_reference",),
+        "model_names": ("dndt",),
+        "code_revision": "task4-aggregate-test",
+        "device": "cpu",
+    }
+
+    first = run_track_a(config, fold_batch=(0,), **common)
+    assert first["status"] == "partial"
+    assert first["completed_units"] == 1
+    assert first["total_units"] == 3
+
+    second = run_track_a(config, resume=True, fold_batch=(1,), **common)
+    assert second["status"] == "partial"
+    assert second["completed_units"] == 2
+    assert second["total_units"] == 3
+    second_metrics = pd.DataFrame(second["metrics"])
+    assert second_metrics["fold"].tolist() == [0, 1]
+    run_dir = tmp_path / "runs" / "batched-aggregate"
+    persisted = pd.read_csv(run_dir / "track_a_metrics.csv")
+    assert persisted["fold"].tolist() == [0, 1]
+    manifest = json.loads(
+        (run_dir / "track_a_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["status"] == "partial"
+    assert len(manifest["authenticated_receipts"]) == 2
+
+    idempotent = run_track_a(config, resume=True, fold_batch=(1,), **common)
+    assert pd.DataFrame(idempotent["metrics"])["fold"].tolist() == [0, 1]
+
+    prior_receipt = (
+        run_dir
+        / "track_a"
+        / "corrected_reference"
+        / "dndt"
+        / "fold_00"
+        / "receipt.json"
+    )
+    receipt = json.loads(prior_receipt.read_text(encoding="utf-8"))
+    receipt["fold"] = 99
+    prior_receipt.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ValueError, match="authenticated fold"):
+        run_track_a(config, resume=True, fold_batch=(1,), **common)
     prepare_track_a_rfecv_cache,
     run_track_a,

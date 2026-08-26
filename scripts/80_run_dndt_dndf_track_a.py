@@ -76,23 +76,44 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _code_revision() -> str:
+def _git_output(repository: Path, *arguments: str) -> str:
     process = subprocess.run(
-        ["git", "-C", str(PROJECT_ROOT), "rev-parse", "HEAD"],
+        ["git", "-C", str(repository), *arguments],
         capture_output=True,
         text=True,
         check=False,
     )
     if process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip()
-        raise RuntimeError(f"cannot resolve code revision: {detail}")
+        raise RuntimeError(
+            f"git {' '.join(arguments)} failed for {repository}: {detail}"
+        )
     return process.stdout.strip()
+
+
+def _code_revision(repository: Path = PROJECT_ROOT) -> str:
+    tracked_status = _git_output(
+        repository,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=no",
+    )
+    if tracked_status:
+        raise RuntimeError(
+            "tracked source tree is dirty; commit or restore tracked changes before "
+            "scientific execution"
+        )
+    revision = _git_output(repository, "rev-parse", "HEAD")
+    if not revision:
+        raise RuntimeError("cannot resolve a nonempty code revision")
+    return revision
 
 
 def main(
     argv: Sequence[str] | None = None,
     *,
     runner: Callable[..., dict[str, object]] = run_track_a,
+    revision_resolver: Callable[[], str] | None = None,
 ) -> int:
     try:
         args = _parse_args(argv)
@@ -106,13 +127,14 @@ def main(
         run_id = f"{args.run_id}-smoke" if args.smoke else args.run_id
         if args.smoke:
             folds = (folds[0],)
+        revision = (revision_resolver or _code_revision)()
         result = runner(
             config,
             run_id=run_id,
             resume=args.resume,
             smoke=args.smoke,
             fold_batch=folds,
-            code_revision=_code_revision(),
+            code_revision=revision,
             device=args.device or config.get("device", "cuda"),
         )
         progress = {
@@ -121,7 +143,7 @@ def main(
             if key not in {"metrics", "predictions"}
         }
         print(json.dumps(progress, sort_keys=True, allow_nan=False))
-        return 0 if result.get("status") == "complete" else 1
+        return 0 if result.get("status") in {"complete", "partial"} else 1
     except Exception as exc:
         print(
             json.dumps(
