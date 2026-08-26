@@ -72,6 +72,26 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--fold-batch",
         help="Inclusive range such as 0-2, a comma list such as 0,3,5, or one fold.",
     )
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        choices=(
+            "author_behaviour_audit",
+            "fresh_fold_author_protocol",
+            "corrected_reference",
+        ),
+        default=(
+            "author_behaviour_audit",
+            "fresh_fold_author_protocol",
+            "corrected_reference",
+        ),
+    )
+    parser.add_argument(
+        "--model-names",
+        nargs="+",
+        choices=("dndt", "dndf"),
+        default=("dndf",),
+    )
     parser.add_argument("--device", choices=("cpu", "cuda"))
     return parser.parse_args(argv)
 
@@ -134,6 +154,8 @@ def main(
             resume=args.resume,
             smoke=args.smoke,
             fold_batch=folds,
+            modes=tuple(args.modes),
+            model_names=tuple(args.model_names),
             code_revision=revision,
             device=args.device or config.get("device", "cuda"),
         )

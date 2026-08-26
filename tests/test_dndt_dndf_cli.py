@@ -43,6 +43,15 @@ def _load_track_a_cli() -> ModuleType:
     return module
 
 
+def _load_track_b_cli() -> ModuleType:
+    script_path = PROJECT_ROOT / "scripts" / "81_run_dndt_dndf_track_b.py"
+    spec = importlib.util.spec_from_file_location("dndt_dndf_track_b_cli", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _write_csv(path: Path, header: list[str], row: list[object] | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -214,6 +223,7 @@ def test_dependency_and_config_contracts_are_exact() -> None:
         "author_repo": "G:/Covid-19-BTP/external/COVID-19-Detection-from-Cough-Sound",
         "author_commit": "feb0e63c790c042eaa21e9f3fc83ed64bdc8a24e",
         "project_features": "G:/Covid-19-BTP/covid_audio_btp/data/processed/features_compare_is10_top800.csv",
+        "project_features_full": "G:/Covid-19-BTP/covid_audio_btp/data/processed/features_compare_is10_merged.csv",
         "external_features": "G:/Covid-19-BTP/covid_audio_btp/data/processed/coughvid_features_compare_is10_top800.csv",
         "metadata": "G:/Covid-19-BTP/covid_audio_btp/data/processed/metadata_with_quality.csv",
         "run_root": "G:/Covid-19-BTP/dndt_dndf_runs",
@@ -233,6 +243,18 @@ def test_dependency_and_config_contracts_are_exact() -> None:
             "tie_breaker": "auprc",
             "max_trials_per_modality": 6,
             "patience": 3,
+        },
+        "prespecified_ladder_dndf": {
+            "source": "author_published_configuration",
+            "num_trees": 25,
+            "depth": 11,
+            "used_features_rate": 0.6,
+            "learning_rate": 0.01,
+            "weight_decay": 0.0,
+            "batch_size": 16,
+            "max_epochs": 14,
+            "patience": 3,
+            "balance_method": "smote",
         },
         "seeds": {"candidate": [42], "final": [42, 314, 2026]},
         "modalities": ["breath", "cough", "speech"],
@@ -688,6 +710,12 @@ def test_track_a_fold_batch_parser_and_cli_smoke_are_machine_readable(
     assert observed["resume"] is True
     assert observed["smoke"] is True
     assert observed["fold_batch"] == (0,)
+    assert observed["modes"] == (
+        "author_behaviour_audit",
+        "fresh_fold_author_protocol",
+        "corrected_reference",
+    )
+    assert observed["model_names"] == ("dndf",)
     assert json.loads(config_path.read_text(encoding="utf-8")) == original
     assert json.loads(capsys.readouterr().out)["status"] == "complete"
 
@@ -815,3 +843,248 @@ def test_author_mode_rejects_late_fold_batch_without_preceding_state(
             code_revision="task4-test",
             device="cpu",
         )
+
+
+def test_track_b_subset_parsers_require_sorted_unique_allowed_values() -> None:
+    module = _load_track_b_cli()
+    assert module.parse_modalities("breath,cough,speech") == (
+        "breath",
+        "cough",
+        "speech",
+    )
+    assert module.parse_protocols(
+        "early_to_late,existing,external_cough,time_stratified"
+    ) == (
+        "early_to_late",
+        "existing",
+        "external_cough",
+        "time_stratified",
+    )
+    assert module.parse_seeds("42,314,2026") == (42, 314, 2026)
+    for parser, value in (
+        (module.parse_modalities, "cough,breath"),
+        (module.parse_modalities, "cough,cough"),
+        (module.parse_protocols, "time_stratified,existing"),
+        (module.parse_seeds, "314,42"),
+        (module.parse_seeds, "42,42"),
+    ):
+        with pytest.raises(ValueError, match="sorted|unique|allowed"):
+            parser(value)
+
+
+def test_track_b_cli_forwards_stage_subsets_and_emits_machine_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    module = _load_track_b_cli()
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"run_root": str(tmp_path), "device": "cpu"}),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    def runner(config: dict[str, object], **kwargs: object) -> dict[str, object]:
+        captured.update({"config": config, **kwargs})
+        return {
+            "status": "partial",
+            "stage": kwargs["stage"],
+            "completed_units": 1,
+            "total_units": 9,
+        }
+
+    exit_code = module.main(
+        [
+            "--config",
+            str(config_path),
+            "--run-id",
+            "batch",
+            "--stage",
+            "final",
+            "--resume",
+            "--modalities",
+            "breath,cough",
+            "--seeds",
+            "42,314",
+            "--device",
+            "cpu",
+        ],
+        runner=runner,
+        revision_resolver=lambda: "task-5-cli-revision",
+    )
+    assert exit_code == 0
+    assert captured["stage"] == "final"
+    assert captured["modalities"] == ("breath", "cough")
+    assert captured["protocols"] is None
+    assert captured["seeds"] == (42, 314)
+    assert captured["resume"] is True
+    assert captured["code_revision"] == "task-5-cli-revision"
+    assert json.loads(capsys.readouterr().out) == {
+        "completed_units": 1,
+        "stage": "final",
+        "status": "partial",
+        "total_units": 9,
+    }
+
+
+def test_track_b_cli_accepts_fusion_stage(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    module = _load_track_b_cli()
+    config_path = tmp_path / "config.json"
+    config_path.write_text('{"device":"cpu"}', encoding="utf-8")
+    observed: dict[str, object] = {}
+
+    def runner(config: object, **kwargs: object) -> dict[str, object]:
+        del config
+        observed.update(kwargs)
+        return {"status": "complete", "completed_units": 6, "total_units": 6}
+
+    assert (
+        module.main(
+            [
+                "--config",
+                str(config_path),
+                "--run-id",
+                "fusion",
+                "--stage",
+                "fusion",
+                "--resume",
+            ],
+            runner=runner,
+            revision_resolver=lambda: "fusion-revision",
+        )
+        == 0
+    )
+    assert observed["stage"] == "fusion"
+    assert observed["resume"] is True
+    assert json.loads(capsys.readouterr().out)["status"] == "complete"
+
+
+def test_track_b_cli_accepts_shuffle_stage(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    module = _load_track_b_cli()
+    config_path = tmp_path / "config.json"
+    config_path.write_text('{"device":"cpu"}', encoding="utf-8")
+    observed: dict[str, object] = {}
+
+    def runner(config: object, **kwargs: object) -> dict[str, object]:
+        del config
+        observed.update(kwargs)
+        return {"status": "complete", "completed_units": 3, "total_units": 3}
+
+    assert (
+        module.main(
+            [
+                "--config",
+                str(config_path),
+                "--run-id",
+                "shuffle",
+                "--stage",
+                "shuffle",
+                "--resume",
+            ],
+            runner=runner,
+            revision_resolver=lambda: "shuffle-revision",
+        )
+        == 0
+    )
+    assert observed["stage"] == "shuffle"
+    assert observed["resume"] is True
+    assert json.loads(capsys.readouterr().out)["status"] == "complete"
+
+
+def test_track_b_cli_rejects_stage_incompatible_flags_and_dirty_source(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_track_b_cli()
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    assert (
+        module.main(
+            [
+                "--config",
+                str(config_path),
+                "--run-id",
+                "bad",
+                "--stage",
+                "candidates",
+                "--seeds",
+                "42",
+            ],
+            runner=lambda *args, **kwargs: {},
+            revision_resolver=lambda: "revision",
+        )
+        == 1
+    )
+    error = json.loads(capsys.readouterr().out)
+    assert error["status"] == "failed"
+    assert "only valid for --stage final" in error["message"]
+
+    monkeypatch.setattr(
+        module,
+        "_git_output",
+        lambda repository, *arguments: (
+            " M src/covid_rars/dndt_dndf_experiment.py"
+            if arguments[0] == "status"
+            else "revision"
+        ),
+    )
+    with pytest.raises(RuntimeError, match="source tree is dirty"):
+        module._code_revision(PROJECT_ROOT)
+
+
+def test_track_b_cli_rejects_untracked_source_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_track_b_cli()
+    observed: list[tuple[str, ...]] = []
+
+    def git_output(repository: Path, *arguments: str) -> str:
+        del repository
+        observed.append(arguments)
+        if arguments[0] == "status":
+            return "?? scripts/untracked_runner.py" if "--untracked-files=all" in arguments else ""
+        return "revision"
+
+    monkeypatch.setattr(module, "_git_output", git_output)
+    with pytest.raises(RuntimeError, match="source tree is dirty"):
+        module._code_revision(PROJECT_ROOT)
+    assert any("--untracked-files=all" in arguments for arguments in observed)
+
+
+def test_dndt_dndf_notebook_is_portable_resumable_and_fail_fast() -> None:
+    path = PROJECT_ROOT / "notebooks" / "08_dndt_dndf_two_day_run.ipynb"
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    code_cells = [
+        cell for cell in notebook["cells"] if cell.get("cell_type") == "code"
+    ]
+    assert len(code_cells) == 6
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in code_cells
+    )
+    for script in (
+        "79_dndt_dndf_preflight.py",
+        "80_run_dndt_dndf_track_a.py",
+        "81_run_dndt_dndf_track_b.py",
+        "82_make_dndt_dndf_evidence.py",
+    ):
+        assert script in source
+    assert source.count("81_run_dndt_dndf_track_b.py") == 5
+    for stage in (
+        "candidates",
+        "final",
+        "fusion",
+        "prespecified_ladder_v2",
+        "shuffle",
+    ):
+        assert f"'--stage', '{stage}'" in source
+    assert source.count("--resume") >= 5
+    assert "subprocess.run" in source and "check=True" in source
+    assert "completion.json" in source
+    assert "completed" in source and "pending" in source
+    assert "date.today" in source
+    assert "G:/" not in source and "G:\\" not in source
+    assert "dndt-dndf-20260826" not in source

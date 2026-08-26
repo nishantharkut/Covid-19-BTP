@@ -2,6 +2,7 @@
   "author_repo": "G:/Covid-19-BTP/external/COVID-19-Detection-from-Cough-Sound",
   "author_commit": "feb0e63c790c042eaa21e9f3fc83ed64bdc8a24e",
   "project_features": "G:/Covid-19-BTP/covid_audio_btp/data/processed/features_compare_is10_top800.csv",
+  "project_features_full": "G:/Covid-19-BTP/covid_audio_btp/data/processed/features_compare_is10_merged.csv",
   "external_features": "G:/Covid-19-BTP/covid_audio_btp/data/processed/coughvid_features_compare_is10_top800.csv",
   "metadata": "G:/Covid-19-BTP/covid_audio_btp/data/processed/metadata_with_quality.csv",
   "run_root": "G:/Covid-19-BTP/dndt_dndf_runs",
@@ -24,6 +25,18 @@
     "tie_breaker": "auprc",
     "max_trials_per_modality": 6,
     "patience": 3
+  },
+  "prespecified_ladder_dndf": {
+    "source": "author_published_configuration",
+    "num_trees": 25,
+    "depth": 11,
+    "used_features_rate": 0.6,
+    "learning_rate": 0.01,
+    "weight_decay": 0.0,
+    "batch_size": 16,
+    "max_epochs": 14,
+    "patience": 3,
+    "balance_method": "smote"
   },
   "seeds": {
     "candidate": [42],

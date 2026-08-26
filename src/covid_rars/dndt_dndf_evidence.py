@@ -35,6 +35,7 @@ EVIDENCE_GROUP_COLUMNS = (
     "mode",
     "analysis_unit",
     "threshold_source",
+    "threshold_comparator",
 )
 
 
@@ -99,12 +100,19 @@ def complete_metric_bundle(
     y_prob: np.ndarray | Iterable[float],
     *,
     threshold: float,
+    threshold_comparator: str = "ge",
     n_bins: int = 10,
 ) -> dict[str, float | int]:
     labels, probabilities = _validated_binary_arrays(y_true, y_prob)
     if not np.isfinite(threshold) or threshold < 0.0 or threshold > 1.0:
         raise ValueError("threshold must be finite and within [0, 1]")
-    predictions = (probabilities >= threshold).astype(np.int64)
+    if threshold_comparator not in {"ge", "gt"}:
+        raise ValueError("threshold_comparator must be 'ge' or 'gt'")
+    predictions = (
+        probabilities >= threshold
+        if threshold_comparator == "ge"
+        else probabilities > threshold
+    ).astype(np.int64)
     tn, fp, fn, tp = confusion_matrix(labels, predictions, labels=[0, 1]).ravel()
     prevalence = float(labels.mean())
     calibration = calibration_bin_table(labels, probabilities, n_bins=n_bins)
@@ -488,10 +496,18 @@ def _metric_groups(predictions: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         thresholds = pd.to_numeric(group["threshold"], errors="coerce").dropna().unique()
         if len(thresholds) != 1:
             raise ValueError("each evidence group must have one frozen threshold")
+        comparators = (
+            group["threshold_comparator"].astype(str).dropna().unique()
+            if "threshold_comparator" in group
+            else np.asarray(["ge"])
+        )
+        if len(comparators) != 1:
+            raise ValueError("each evidence group must have one threshold comparator")
         metrics = complete_metric_bundle(
             participant["label_binary"].to_numpy(),
             participant["probability"].to_numpy(),
             threshold=float(thresholds[0]),
+            threshold_comparator=str(comparators[0]),
         )
         rows.append(dict(zip(group_columns, keys)) | metrics)
     return pd.DataFrame(rows), group_columns
@@ -664,14 +680,182 @@ def _model_selection_table(path: Path) -> pd.DataFrame:
     if not path.is_file():
         return pd.DataFrame(columns=["modality", "selection_json"])
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("selected configurations must be a JSON object")
+    if not isinstance(payload, dict) or set(payload) != {"format_version", "modalities"}:
+        raise ValueError(
+            "selected configurations must contain only format_version and modalities"
+        )
+    if payload["format_version"] != 1 or not isinstance(payload["modalities"], dict):
+        raise ValueError("selected configuration modalities are invalid")
+    modalities = payload["modalities"]
     return pd.DataFrame(
         [
             {"modality": modality, "selection_json": json.dumps(value, sort_keys=True)}
-            for modality, value in sorted(payload.items())
+            for modality, value in sorted(modalities.items())
         ]
     )
+
+
+_REQUIRED_RUN_MANIFESTS = (
+    (Path("track_a_manifest.json"), "A", None),
+    (Path("track_b/candidates_manifest.json"), "B", "candidates"),
+    (Path("track_b/final_manifest.json"), "B", "final"),
+    (Path("track_b/fusion_manifest.json"), "B", "fusion"),
+    (
+        Path("track_b/prespecified_ladder_v2_manifest.json"),
+        "B",
+        "prespecified_ladder_v2",
+    ),
+    (Path("track_b/shuffle_manifest.json"), "B", "shuffle"),
+)
+
+_REQUIRED_STAGE_ARTIFACTS = {
+    "candidates": {"selected_configurations"},
+    "final": {"recording_predictions", "participant_predictions", "metrics"},
+    "prespecified_ladder_v2": {
+        "recording_predictions",
+        "participant_predictions",
+        "metrics",
+        "feature_lineage",
+    },
+    "shuffle": {"recording_predictions", "participant_predictions", "metrics"},
+    "fusion": {"participant_predictions", "metrics", "weights"},
+}
+_REQUIRED_TRACK_A_ARTIFACTS = {
+    "predictions",
+    "metrics",
+    "rfecv_outer_test_exposure",
+}
+
+
+def _validate_complete_run_manifests(run_path: Path) -> list[Path]:
+    validated: list[Path] = []
+    for relative_path, expected_track, expected_stage in _REQUIRED_RUN_MANIFESTS:
+        path = run_path / relative_path
+        if not path.is_file():
+            raise ValueError(f"required run manifest is missing: {relative_path}")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"required run manifest cannot be read: {relative_path}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"required run manifest must be an object: {relative_path}")
+        if payload.get("run_id") != run_path.name:
+            raise ValueError(f"{relative_path} run_id does not match the run directory")
+        if payload.get("track") != expected_track:
+            raise ValueError(f"{relative_path} track identity is invalid")
+        if expected_stage is not None and payload.get("stage") != expected_stage:
+            raise ValueError(f"{relative_path} stage identity is invalid")
+        if expected_stage == "shuffle" and (
+            payload.get("control_scope")
+            != "single_permutation_fit_stage_sanity_check"
+            or payload.get("permutation_seed") != 42
+        ):
+            raise ValueError("shuffle control scope is invalid")
+        if payload.get("status") != "complete":
+            raise ValueError(f"{relative_path} must be complete before evidence generation")
+        if expected_track == "A":
+            required_design = payload.get("required_design")
+            if (
+                payload.get("design_contract_complete") is not True
+                or required_design
+                != {
+                    "modes": [
+                        "author_behaviour_audit",
+                        "fresh_fold_author_protocol",
+                        "corrected_reference",
+                    ],
+                    "model_names": ["dndf"],
+                    "folds": list(range(10)),
+                }
+            ):
+                raise ValueError("Track A required design contract is incomplete")
+        completed = payload.get("completed_units")
+        total = payload.get("total_units")
+        if (
+            not isinstance(completed, int)
+            or isinstance(completed, bool)
+            or not isinstance(total, int)
+            or isinstance(total, bool)
+            or completed < 1
+            or completed != total
+        ):
+            raise ValueError(f"{relative_path} has incomplete unit counts")
+        receipts = payload.get("authenticated_receipts")
+        if not isinstance(receipts, list) or len(receipts) != completed:
+            raise ValueError(f"{relative_path} authenticated receipt count is invalid")
+        for descriptor in receipts:
+            if not isinstance(descriptor, dict) or set(descriptor) != {"path", "sha256"}:
+                raise ValueError(
+                    f"{relative_path} authenticated receipt descriptor is invalid"
+                )
+            expected_sha = descriptor["sha256"]
+            if (
+                not isinstance(expected_sha, str)
+                or len(expected_sha) != 64
+                or any(character not in "0123456789abcdef" for character in expected_sha)
+            ):
+                raise ValueError(f"{relative_path} authenticated receipt SHA256 is invalid")
+            receipt_path = Path(str(descriptor["path"]))
+            if not receipt_path.is_absolute():
+                receipt_path = run_path / receipt_path
+            receipt_path = receipt_path.resolve()
+            if not receipt_path.is_relative_to(run_path):
+                raise ValueError(
+                    f"{relative_path} authenticated receipt is outside the run directory"
+                )
+            if not receipt_path.is_file() or _sha256(receipt_path) != expected_sha:
+                raise ValueError(
+                    f"{relative_path} authenticated receipt is missing or tampered"
+                )
+        required_artifacts = (
+            _REQUIRED_TRACK_A_ARTIFACTS
+            if expected_track == "A"
+            else _REQUIRED_STAGE_ARTIFACTS.get(str(expected_stage))
+        )
+        if required_artifacts is not None:
+            artifacts = payload.get("artifacts")
+            if not isinstance(artifacts, dict) or set(artifacts) != required_artifacts:
+                raise ValueError(f"{relative_path} manifest artifact schema is invalid")
+            for name, descriptor in artifacts.items():
+                if not isinstance(descriptor, dict) or set(descriptor) != {
+                    "path",
+                    "sha256",
+                }:
+                    raise ValueError(
+                        f"{relative_path} manifest artifact descriptor is invalid: {name}"
+                    )
+                expected_sha = descriptor["sha256"]
+                if (
+                    not isinstance(expected_sha, str)
+                    or len(expected_sha) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in expected_sha
+                    )
+                ):
+                    raise ValueError(
+                        f"{relative_path} manifest artifact SHA256 is invalid: {name}"
+                    )
+                artifact_path = Path(str(descriptor["path"]))
+                if not artifact_path.is_absolute():
+                    artifact_path = run_path / artifact_path
+                artifact_path = artifact_path.resolve()
+                if not artifact_path.is_relative_to(run_path):
+                    raise ValueError(
+                        f"{relative_path} manifest artifact is outside the run directory: {name}"
+                    )
+                if not artifact_path.is_file() or _sha256(artifact_path) != expected_sha:
+                    raise ValueError(
+                        f"{relative_path} manifest artifact is missing or tampered: {name}"
+                    )
+                if expected_stage == "candidates" and name == "selected_configurations":
+                    expected_path = (run_path / "track_b" / "selected_configurations.json").resolve()
+                    if artifact_path != expected_path:
+                        raise ValueError(
+                            f"{relative_path} selected configuration artifact path is invalid"
+                        )
+        validated.append(path)
+    return validated
 
 
 def generate_evidence(
@@ -683,6 +867,7 @@ def generate_evidence(
     run_path = Path(run_dir).resolve()
     if not run_path.is_dir():
         raise ValueError(f"run directory does not exist: {run_path}")
+    manifest_paths = _validate_complete_run_manifests(run_path)
     prediction_paths = _prediction_inputs(run_path)
     predictions = _load_predictions(prediction_paths)
     run_ids = predictions["run_id"].astype(str).unique()
@@ -724,7 +909,11 @@ def generate_evidence(
     }
     for name, table in tables.items():
         _atomic_csv(table, evidence_dir / name)
-    input_paths = prediction_paths + ([selected_path] if selected_path.is_file() else [])
+    input_paths = (
+        manifest_paths
+        + prediction_paths
+        + ([selected_path] if selected_path.is_file() else [])
+    )
     if fusion_source.is_file():
         input_paths.append(fusion_source)
     inputs = {

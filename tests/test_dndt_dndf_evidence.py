@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import numpy as np
 import pandas as pd
@@ -10,6 +11,8 @@ import pytest
 from sklearn.metrics import average_precision_score, log_loss, roc_auc_score
 
 from covid_rars.dndt_dndf_evidence import (
+    _model_selection_table,
+    _validate_complete_run_manifests,
     bootstrap_metric_delta,
     calibration_bin_table,
     complete_metric_bundle,
@@ -60,6 +63,36 @@ def test_complete_metric_bundle_matches_known_binary_case() -> None:
     assert result["auroc"] == pytest.approx(roc_auc_score(y_true, y_prob))
     assert result["auprc"] == pytest.approx(average_precision_score(y_true, y_prob))
     assert result["auprc_lift"] == pytest.approx(result["auprc"] / 0.5)
+
+
+def test_complete_metric_bundle_honors_threshold_comparator() -> None:
+    y_true = np.array([0, 1], dtype=np.int64)
+    y_prob = np.array([0.5, 0.5], dtype=np.float64)
+
+    greater_equal = complete_metric_bundle(
+        y_true,
+        y_prob,
+        threshold=0.5,
+        threshold_comparator="ge",
+    )
+    strict_greater = complete_metric_bundle(
+        y_true,
+        y_prob,
+        threshold=0.5,
+        threshold_comparator="gt",
+    )
+
+    assert greater_equal["tn"] == 0
+    assert greater_equal["tp"] == 1
+    assert strict_greater["tn"] == 1
+    assert strict_greater["tp"] == 0
+    with pytest.raises(ValueError, match="threshold_comparator"):
+        complete_metric_bundle(
+            y_true,
+            y_prob,
+            threshold=0.5,
+            threshold_comparator="invalid",
+        )
 
 
 @pytest.mark.parametrize(
@@ -240,6 +273,311 @@ def _track_b_rows(
     ]
 
 
+_REQUIRED_MANIFEST_FIXTURES = (
+    (Path("track_a_manifest.json"), "A", None),
+    (Path("track_b/candidates_manifest.json"), "B", "candidates"),
+    (Path("track_b/final_manifest.json"), "B", "final"),
+    (Path("track_b/fusion_manifest.json"), "B", "fusion"),
+    (
+        Path("track_b/prespecified_ladder_v2_manifest.json"),
+        "B",
+        "prespecified_ladder_v2",
+    ),
+    (Path("track_b/shuffle_manifest.json"), "B", "shuffle"),
+)
+
+
+def _write_complete_manifest_fixtures(run_dir: Path) -> list[Path]:
+    receipt_dir = run_dir / "fixture_receipts"
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    selected_path = run_dir / "track_b" / "selected_configurations.json"
+    selected_path.parent.mkdir(parents=True, exist_ok=True)
+    if not selected_path.is_file():
+        selected_path.write_text(
+            json.dumps(
+                {
+                    "format_version": 1,
+                    "modalities": {
+                        "cough": {
+                            "overall_winner": "dndf",
+                            "selected_configuration_sha256": "a" * 64,
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+    receipts: list[Path] = []
+    for index, (relative_path, track, stage) in enumerate(
+        _REQUIRED_MANIFEST_FIXTURES
+    ):
+        receipt_path = receipt_dir / f"receipt_{index}.json"
+        receipt_path.write_text(
+            json.dumps(
+                {
+                    "run_id": run_dir.name,
+                    "track": track,
+                    "stage": stage,
+                    "status": "complete",
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        receipt_sha = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+        payload: dict[str, object] = {
+            "run_id": run_dir.name,
+            "track": track,
+            "status": "complete",
+            "completed_units": 1,
+            "total_units": 1,
+            "authenticated_receipts": [
+                {"path": str(receipt_path), "sha256": receipt_sha}
+            ],
+        }
+        if track == "A":
+            payload["required_design"] = {
+                "modes": [
+                    "author_behaviour_audit",
+                    "fresh_fold_author_protocol",
+                    "corrected_reference",
+                ],
+                "model_names": ["dndf"],
+                "folds": list(range(10)),
+            }
+            payload["design_contract_complete"] = True
+        if stage is not None:
+            payload["stage"] = stage
+        if stage == "shuffle":
+            payload["control_scope"] = "single_permutation_fit_stage_sanity_check"
+            payload["permutation_seed"] = 42
+        artifact_names = {
+            "track_a": ("predictions", "metrics", "rfecv_outer_test_exposure"),
+            "final": ("recording_predictions", "participant_predictions", "metrics"),
+            "prespecified_ladder_v2": (
+                "recording_predictions",
+                "participant_predictions",
+                "metrics",
+                "feature_lineage",
+            ),
+            "shuffle": ("recording_predictions", "participant_predictions", "metrics"),
+            "fusion": ("participant_predictions", "metrics", "weights"),
+            "candidates": ("selected_configurations",),
+        }.get("track_a" if track == "A" else str(stage), ())
+        if artifact_names:
+            artifacts: dict[str, dict[str, str]] = {}
+            for artifact_name in artifact_names:
+                suffix = "csv"
+                preferred = (
+                    selected_path
+                    if stage == "candidates" and artifact_name == "selected_configurations"
+                    else run_dir / "track_b" / f"{stage}_{artifact_name}.{suffix}"
+                )
+                artifact_path = (
+                    preferred
+                    if preferred.is_file()
+                    else receipt_dir / f"{stage}_{artifact_name}.bin"
+                )
+                if not artifact_path.exists():
+                    artifact_path.write_bytes(f"{stage}:{artifact_name}".encode("ascii"))
+                artifacts[artifact_name] = {
+                    "path": str(artifact_path),
+                    "sha256": hashlib.sha256(artifact_path.read_bytes()).hexdigest(),
+                }
+            payload["artifacts"] = artifacts
+        manifest_path = run_dir / relative_path
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        receipts.append(receipt_path)
+    return receipts
+
+
+def test_model_selection_table_reads_nested_modality_payload(tmp_path: Path) -> None:
+    selected_path = tmp_path / "selected_configurations.json"
+    selected_path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "modalities": {
+                    modality: {
+                        "overall_winner": "dndf",
+                        "selected_configuration_sha256": character * 64,
+                    }
+                    for modality, character in (
+                        ("breath", "a"),
+                        ("cough", "b"),
+                        ("speech", "c"),
+                    )
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    table = _model_selection_table(selected_path)
+
+    assert table["modality"].tolist() == ["breath", "cough", "speech"]
+    assert "format_version" not in set(table["modality"])
+    assert "modalities" not in set(table["modality"])
+
+
+def test_generate_evidence_rejects_partial_required_manifest(tmp_path: Path) -> None:
+    run_dir = tmp_path / "partial-run"
+    track_b = run_dir / "track_b"
+    track_b.mkdir(parents=True)
+    frame = pd.DataFrame(
+        _track_b_rows(
+            stage="final",
+            protocol="existing",
+            model_name="dndf",
+            split="test",
+            dataset="coswara",
+            participant_prefix="p",
+            probabilities=[0.1, 0.2, 0.8, 0.9],
+            labels=[0, 0, 1, 1],
+        )
+    )
+    frame["run_id"] = run_dir.name
+    frame.to_csv(track_b / "final_participant_predictions.csv", index=False)
+    (run_dir / "track_a_manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_dir.name,
+                "track": "A",
+                "status": "partial",
+                "completed_units": 1,
+                "total_units": 40,
+                "authenticated_receipts": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="track_a_manifest.*complete"):
+        generate_evidence(run_dir, n_bootstraps=5, seed=1)
+
+
+def test_complete_manifest_validation_requires_authenticated_candidate_selection(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "candidate-artifact-required"
+    run_dir.mkdir()
+    _write_complete_manifest_fixtures(run_dir)
+    manifest_path = run_dir / "track_b" / "candidates_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("artifacts", None)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="candidates_manifest.*artifact schema"):
+        _validate_complete_run_manifests(run_dir)
+
+
+def test_complete_manifest_validation_rejects_reduced_track_a_design(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "reduced-track-a"
+    run_dir.mkdir()
+    _write_complete_manifest_fixtures(run_dir)
+    manifest_path = run_dir / "track_a_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["design_contract_complete"] = False
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Track A required design contract"):
+        _validate_complete_run_manifests(run_dir)
+
+
+def test_complete_manifest_validation_requires_precise_shuffle_scope(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "shuffle-scope"
+    run_dir.mkdir()
+    _write_complete_manifest_fixtures(run_dir)
+    manifest_path = run_dir / "track_b" / "shuffle_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["control_scope"] = "permutation_test"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="shuffle control scope"):
+        _validate_complete_run_manifests(run_dir)
+
+
+def test_complete_manifest_validation_requires_ladder_feature_lineage(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "ladder-feature-lineage"
+    run_dir.mkdir()
+    _write_complete_manifest_fixtures(run_dir)
+    manifest_path = (
+        run_dir / "track_b" / "prespecified_ladder_v2_manifest.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"].pop("feature_lineage", None)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError, match="prespecified_ladder_v2_manifest.*artifact schema"
+    ):
+        _validate_complete_run_manifests(run_dir)
+
+
+def test_generate_evidence_rejects_tampered_authenticated_receipt(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "tampered-run"
+    run_dir.mkdir()
+    receipts = _write_complete_manifest_fixtures(run_dir)
+    receipts[2].write_text('{"tampered":true}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="authenticated receipt.*tampered"):
+        generate_evidence(run_dir, n_bootstraps=5, seed=1)
+
+
+def test_generate_evidence_rejects_tampered_track_a_aggregate_artifact(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "track-a-aggregate-tamper"
+    run_dir.mkdir()
+    _write_complete_manifest_fixtures(run_dir)
+    manifest = json.loads(
+        (run_dir / "track_a_manifest.json").read_text(encoding="utf-8")
+    )
+    descriptor = manifest["artifacts"]["rfecv_outer_test_exposure"]
+    artifact_path = Path(descriptor["path"])
+    artifact_path.write_bytes(artifact_path.read_bytes() + b"tampered")
+
+    with pytest.raises(ValueError, match="track_a_manifest.*artifact.*tampered"):
+        generate_evidence(run_dir, n_bootstraps=5, seed=1)
+
+
+def test_generate_evidence_rejects_tampered_aggregate_prediction(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "aggregate-tamper-run"
+    track_b = run_dir / "track_b"
+    track_b.mkdir(parents=True)
+    prediction_path = track_b / "final_participant_predictions.csv"
+    frame = pd.DataFrame(
+        _track_b_rows(
+            stage="final",
+            protocol="existing",
+            model_name="dndf",
+            split="test",
+            dataset="coswara",
+            participant_prefix="p",
+            probabilities=[0.1, 0.2, 0.8, 0.9],
+            labels=[0, 0, 1, 1],
+        )
+    )
+    frame["run_id"] = run_dir.name
+    frame.to_csv(prediction_path, index=False)
+    _write_complete_manifest_fixtures(run_dir)
+    prediction_path.write_bytes(prediction_path.read_bytes() + b"\n")
+
+    with pytest.raises(ValueError, match="manifest artifact.*tampered"):
+        generate_evidence(run_dir, n_bootstraps=5, seed=1)
+
+
 def test_generate_evidence_writes_complete_tables_and_recomputable_metrics(
     tmp_path,
 ) -> None:
@@ -275,11 +613,13 @@ def test_generate_evidence_writes_complete_tables_and_recomputable_metrics(
                 labels=labels,
             )
         )
-    pd.DataFrame(final_rows).to_csv(
-        track_b / "final_participant_predictions.csv", index=False
+    final_frame = pd.DataFrame(final_rows)
+    final_frame["label_binary"] = final_frame["label_binary"].map(
+        {0: "negative", 1: "positive"}
     )
+    final_frame.to_csv(track_b / "final_participant_predictions.csv", index=False)
     ladder_rows = _track_b_rows(
-        stage="ladder",
+        stage="prespecified_ladder_v2",
         protocol="external_cough",
         model_name="dndf",
         split="validation",
@@ -288,7 +628,7 @@ def test_generate_evidence_writes_complete_tables_and_recomputable_metrics(
         probabilities=validation_probabilities,
         labels=labels,
     ) + _track_b_rows(
-        stage="ladder",
+        stage="prespecified_ladder_v2",
         protocol="external_cough",
         model_name="dndf",
         split="external",
@@ -297,13 +637,26 @@ def test_generate_evidence_writes_complete_tables_and_recomputable_metrics(
         probabilities=[0.55, 0.45, 0.50, 0.60],
         labels=labels,
     )
-    pd.DataFrame(ladder_rows).to_csv(
-        track_b / "ladder_participant_predictions.csv", index=False
+    ladder_frame = pd.DataFrame(ladder_rows)
+    ladder_frame["label_binary"] = ladder_frame["label_binary"].map(
+        {0: "negative", 1: "positive"}
     )
+    ladder_frame.to_csv(
+        track_b / "prespecified_ladder_v2_participant_predictions.csv", index=False
+    )
+    _write_complete_manifest_fixtures(run_dir)
     (track_b / "selected_configurations.json").write_text(
-        '{"cough":{"overall_winner":"dndf","selected_configuration_sha256":"'
-        + "a" * 64
-        + '"}}',
+        json.dumps(
+            {
+                "format_version": 1,
+                "modalities": {
+                    "cough": {
+                        "overall_winner": "dndf",
+                        "selected_configuration_sha256": "a" * 64,
+                    }
+                },
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -349,8 +702,14 @@ def test_generate_evidence_writes_complete_tables_and_recomputable_metrics(
     assert manifest["n_bootstraps"] == 50
     assert set(manifest["inputs"]) == {
         "final_participant_predictions.csv",
-        "ladder_participant_predictions.csv",
+        "prespecified_ladder_v2_participant_predictions.csv",
         "selected_configurations.json",
+        "track_a_manifest.json",
+        "candidates_manifest.json",
+        "final_manifest.json",
+        "fusion_manifest.json",
+        "prespecified_ladder_v2_manifest.json",
+        "shuffle_manifest.json",
     }
 
 
@@ -380,6 +739,7 @@ def test_evidence_cli_generates_outputs_from_configured_run_root(tmp_path: Path)
     frame = pd.DataFrame(rows)
     frame["run_id"] = "cli-run"
     frame.to_csv(track_b / "final_participant_predictions.csv", index=False)
+    _write_complete_manifest_fixtures(run_dir)
     config = tmp_path / "config.json"
     config.write_text(json.dumps({"run_root": str(tmp_path)}), encoding="utf-8")
     project_root = Path(__file__).resolve().parents[1]

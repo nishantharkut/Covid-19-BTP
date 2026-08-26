@@ -20,36 +20,301 @@ import torch
 
 from covid_rars.dndt_dndf_experiment import (
     AuthorTrackAArtifacts,
+    CandidateSelectionResult,
     EXPECTED_TRACK_A_SELECTED_INDICES,
     PREDICTION_COLUMNS,
     FitResult,
     PlannedInterruption,
     TrackAFeatureCache,
+    TrackBData,
     TrainConfig,
     _predict_probabilities,
     _track_a_corrected_fit_no_scaler,
     _atomic_torch_save,
+    _build_track_b_shuffle_protocol,
     _exclusive_rfecv_cache_lock,
     _manifest_path,
+    _load_track_b_candidate_receipt,
     _publish_checkpoint_generation,
+    _participant_validation_arrays,
     _resolve_checkpoint_manifest,
+    _track_b_checkpoint_input_sha256,
+    _track_b_study_name,
     aggregate_participant_probabilities,
     author_threshold_to_covid_threshold,
     author_threshold_sweep,
     balance_training_rows,
+    build_track_b_protocols,
     checkpoint_sha256,
     deterministic_batch_indices,
     fixed_order_batch_indices,
     fit_model,
+    fit_validation_logistic_fusion,
     fit_preprocessor,
+    load_track_b_data,
     normalize_execution_backend,
     prepare_track_a_rfecv_cache,
     run_track_a,
+    run_track_b,
+    track_a_rfecv_outer_test_exposure,
+    uniform_dndf_fusion,
+    select_modality_configuration,
     transform_features,
+    validate_frozen_track_b_lineage,
     validate_prediction_frame,
     write_predictions,
 )
 from covid_rars.dndt_dndf_models import ModelConfig
+from covid_rars.dndt_dndf_evidence import complete_metric_bundle
+from covid_rars.features import feature_columns
+from covid_rars.metrics import best_threshold_by_balanced_accuracy
+
+
+def _fusion_prediction_fixture() -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    split_values = {
+        "validation": (
+            [0, 0, 0, 1, 1, 1],
+            [0.10, 0.25, 0.40, 0.60, 0.75, 0.90],
+            [0.20, 0.30, 0.35, 0.65, 0.70, 0.85],
+        ),
+        "test": (
+            [0, 0, 1, 1],
+            [0.15, 0.45, 0.55, 0.80],
+            [0.25, 0.40, 0.70, 0.75],
+        ),
+    }
+    for split, (labels, cough, speech) in split_values.items():
+        for index, label in enumerate(labels):
+            participant = f"{split}-p{index}"
+            for modality, probability in (
+                ("cough", cough[index]),
+                ("speech", speech[index]),
+            ):
+                rows.append(
+                    {
+                        "participant_id": participant,
+                        "recording_id": participant,
+                        "label_binary": label,
+                        "split": split,
+                        "modality": modality,
+                        "probability": probability,
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def _assert_complete_metrics_match_predictions(
+    metric: pd.Series,
+    predictions: pd.DataFrame,
+) -> None:
+    labels = predictions["label_binary"]
+    if not pd.api.types.is_numeric_dtype(labels):
+        labels = labels.map({"negative": 0, "positive": 1})
+    expected = complete_metric_bundle(
+        labels.to_numpy(dtype=np.int64),
+        predictions["probability"].to_numpy(dtype=np.float64),
+        threshold=float(metric["threshold"]),
+    )
+    for name, value in expected.items():
+        assert name in metric.index
+        assert float(metric[name]) == pytest.approx(float(value), abs=1e-15)
+
+
+def test_validation_logistic_fusion_weights_ignore_test_labels_and_probabilities() -> None:
+    predictions = _fusion_prediction_fixture()
+    first_predictions, first_weights = fit_validation_logistic_fusion(
+        predictions, seed=42
+    )
+    changed = predictions.copy()
+    test_mask = changed["split"].eq("test")
+    changed.loc[test_mask, "probability"] = 1.0 - changed.loc[
+        test_mask, "probability"
+    ]
+    changed.loc[test_mask, "label_binary"] = 1 - changed.loc[
+        test_mask, "label_binary"
+    ]
+
+    changed_predictions, changed_weights = fit_validation_logistic_fusion(
+        changed, seed=42
+    )
+
+    pd.testing.assert_frame_equal(first_weights, changed_weights)
+    assert set(first_predictions["split"]) == {"validation", "test"}
+    assert not np.allclose(
+        first_predictions.loc[first_predictions["split"].eq("test"), "probability"],
+        changed_predictions.loc[changed_predictions["split"].eq("test"), "probability"],
+    )
+
+
+def test_uniform_dndf_fusion_averages_only_available_modalities() -> None:
+    predictions = _fusion_prediction_fixture()
+    breath = predictions[
+        predictions["modality"].eq("cough")
+        & predictions["participant_id"].ne("test-p0")
+    ].copy()
+    breath["modality"] = "breath"
+    breath["probability"] = 0.9
+    combined = pd.concat([predictions, breath], ignore_index=True)
+
+    fused = uniform_dndf_fusion(combined)
+
+    row = fused.loc[fused["participant_id"].eq("test-p0")].iloc[0]
+    expected = np.mean(
+        predictions.loc[
+            predictions["participant_id"].eq("test-p0"), "probability"
+        ].to_numpy(dtype=np.float64)
+    )
+    assert row["probability"] == pytest.approx(expected)
+    assert row["available_modalities"] == "cough,speech"
+    complete = fused.loc[fused["participant_id"].eq("test-p1")].iloc[0]
+    assert complete["available_modalities"] == "breath,cough,speech"
+
+
+def test_track_b_fusion_emits_frozen_three_seed_artifacts(tmp_path: Path) -> None:
+    config = _track_b_config(tmp_path)
+    run_track_b(
+        config,
+        run_id="fusion-run",
+        stage="candidates",
+        modalities=("breath", "cough", "speech"),
+        code_revision="fusion-test-revision",
+        device="cpu",
+        candidate_evaluator=_winning_dndf_candidate_evaluator,
+    )
+
+    def evaluate_unit(
+        model_config: ModelConfig,
+        train_config: TrainConfig,
+        training: pd.DataFrame,
+        validation: pd.DataFrame,
+        evaluation: pd.DataFrame,
+        feature_names: tuple[str, ...],
+        unit_dir: Path,
+        resume: bool,
+    ) -> dict[str, object]:
+        del model_config, training, feature_names, resume
+        modality_offset = {
+            "breath": -0.03,
+            "cough": 0.00,
+            "speech": 0.03,
+        }[str(validation["modality"].iloc[0])]
+
+        def probabilities(frame: pd.DataFrame) -> np.ndarray:
+            labels = frame["label_binary"].map(
+                {"negative": 0.0, "positive": 1.0}
+            ).to_numpy(dtype=np.float64)
+            seed_offset = (train_config.seed % 11) / 1000.0
+            return np.clip(
+                0.2 + labels * 0.6 + modality_offset + seed_offset,
+                0.01,
+                0.99,
+            )
+
+        checkpoint = unit_dir / "fake-checkpoint.bin"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_bytes(
+            f"{validation['modality'].iloc[0]}:{train_config.seed}".encode("ascii")
+        )
+        return {
+            "validation_probability": probabilities(validation),
+            "evaluation_probability": probabilities(evaluation),
+            "checkpoint_path": checkpoint,
+            "best_epoch": 1,
+        }
+
+    final = run_track_b(
+        config,
+        run_id="fusion-run",
+        stage="final",
+        modalities=("breath", "cough", "speech"),
+        code_revision="fusion-test-revision",
+        device="cpu",
+        unit_evaluator=evaluate_unit,
+    )
+    assert final["status"] == "complete"
+
+    fusion = run_track_b(
+        config,
+        run_id="fusion-run",
+        stage="fusion",
+        code_revision="fusion-test-revision",
+        device="cpu",
+    )
+
+    assert fusion["status"] == "complete"
+    assert fusion["completed_units"] == fusion["total_units"] == 6
+    track_b = Path(str(config["run_root"])) / "fusion-run" / "track_b"
+    predictions = pd.read_csv(track_b / "fusion_participant_predictions.csv")
+    metrics = pd.read_csv(track_b / "fusion_metrics.csv")
+    weights = pd.read_csv(track_b / "fusion_weights.csv")
+    manifest = json.loads(
+        (track_b / "fusion_manifest.json").read_text(encoding="utf-8")
+    )
+    assert set(predictions["seed"]) == {42, 314, 2026}
+    assert set(predictions["split"]) == {"validation", "test"}
+    assert set(predictions["model_name"]) == {
+        "dndf_cough_speech_validation_stack",
+        "dndf_breath_cough_speech_uniform",
+    }
+    assert len(metrics) == 6
+    assert set(weights["fusion_method"]) == {
+        "validation_logistic_stack",
+        "uniform_mean",
+    }
+    assert manifest["status"] == "complete"
+    metric = metrics.loc[
+        metrics["seed"].eq(42)
+        & metrics["model_name"].eq("dndf_cough_speech_validation_stack")
+    ].iloc[0]
+    metric_predictions = predictions.loc[
+        predictions["seed"].eq(42)
+        & predictions["model_name"].eq("dndf_cough_speech_validation_stack")
+        & predictions["split"].eq("test")
+    ]
+    _assert_complete_metrics_match_predictions(metric, metric_predictions)
+
+    unit_files = sorted(
+        path
+        for path in (track_b / "fusion").rglob("*")
+        if path.is_file()
+    )
+    before = {
+        str(path.relative_to(track_b)): (checkpoint_sha256(path), path.stat().st_mtime_ns)
+        for path in unit_files
+    }
+    resumed = run_track_b(
+        config,
+        run_id="fusion-run",
+        stage="fusion",
+        resume=True,
+        code_revision="fusion-test-revision",
+        device="cpu",
+    )
+    after = {
+        str(path.relative_to(track_b)): (checkpoint_sha256(path), path.stat().st_mtime_ns)
+        for path in unit_files
+    }
+    assert resumed["status"] == "complete"
+    assert after == before
+
+    tampered = (
+        track_b
+        / "fusion"
+        / "seed_42"
+        / "validation_logistic_stack"
+        / "participant_predictions.csv"
+    )
+    tampered.write_bytes(tampered.read_bytes() + b"\n")
+    with pytest.raises(ValueError, match="fusion.*artifact|fusion.*receipt"):
+        run_track_b(
+            config,
+            run_id="fusion-run",
+            stage="fusion",
+            resume=True,
+            code_revision="fusion-test-revision",
+            device="cpu",
+        )
 
 
 def _malicious_checkpoint_side_effect(path: str) -> dict[str, object]:
@@ -200,6 +465,68 @@ def _train_config(**overrides: object) -> TrainConfig:
     return TrainConfig(**values)  # type: ignore[arg-type]
 
 
+def _track_b_tables(
+    feature_count: int = 800,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    feature_names = [f"feature_{index:03d}" for index in range(feature_count)]
+    rows: list[dict[str, object]] = []
+    metadata_rows: list[dict[str, object]] = []
+    splits = ("train", "validation", "test")
+    for participant_index in range(18):
+        participant_id = f"p{participant_index:02d}"
+        label = "positive" if participant_index % 2 else "negative"
+        split = splits[participant_index % len(splits)]
+        metadata_rows.append(
+            {
+                "participant_id": participant_id,
+                "label_binary": label,
+                "split": split,
+                "recording_date": (
+                    f"2021-{participant_index // 6 + 1:02d}-"
+                    f"{participant_index % 6 + 1:02d}"
+                ),
+            }
+        )
+        for modality_index, modality in enumerate(("breath", "cough", "speech")):
+            row: dict[str, object] = {
+                "recording_id": f"r-{participant_id}-{modality}",
+                "participant_id": participant_id,
+                "dataset": "coswara",
+                "modality": modality,
+                "submodality": "standard",
+                "label_binary": label,
+                "split": split,
+            }
+            row.update(
+                {
+                    name: float(
+                        participant_index + modality_index + feature_index / 1000
+                    )
+                    for feature_index, name in enumerate(feature_names)
+                }
+            )
+            rows.append(row)
+    external_rows: list[dict[str, object]] = []
+    for participant_index in range(6):
+        row = {
+            "recording_id": f"cv-r{participant_index}",
+            "participant_id": f"cv-p{participant_index}",
+            "dataset": "coughvid",
+            "modality": "cough",
+            "submodality": "unknown",
+            "label_binary": "positive" if participant_index % 2 else "negative",
+            "split": "external",
+        }
+        row.update(
+            {
+                name: float(participant_index + feature_index / 1000)
+                for feature_index, name in enumerate(feature_names)
+            }
+        )
+        external_rows.append(row)
+    return pd.DataFrame(rows), pd.DataFrame(external_rows), pd.DataFrame(metadata_rows)
+
+
 def _fit(
     directory: Path,
     *,
@@ -228,6 +555,1449 @@ def _fit(
         interrupt_after_epoch=interrupt_after_epoch,
         prediction_batch_size=4,
     )
+
+
+def test_track_b_protocols_isolate_participants_for_every_modality(
+    tmp_path: Path,
+) -> None:
+    project, external, metadata = _track_b_tables()
+    project_path = tmp_path / "project.csv"
+    external_path = tmp_path / "external.csv"
+    metadata_path = tmp_path / "metadata.csv"
+    project.to_csv(project_path, index=False)
+    external.to_csv(external_path, index=False)
+    metadata.to_csv(metadata_path, index=False)
+
+    data = load_track_b_data(project_path, external_path, metadata_path)
+    assert isinstance(data, TrackBData)
+    assert len(data.feature_columns) == 800
+    protocols = build_track_b_protocols(data)
+
+    for protocol_name in ("existing", "time_stratified", "early_to_late"):
+        protocol = protocols[protocol_name]
+        assert protocol.split_sha256 == _canonical_frame_hash(
+            protocol.participant_assignments
+        )
+        for modality in ("breath", "cough", "speech"):
+            modality_rows = protocol.source[protocol.source["modality"].eq(modality)]
+            participants = {
+                split: set(
+                    modality_rows.loc[
+                        modality_rows["split"].eq(split), "participant_id"
+                    ].astype(str)
+                )
+                for split in ("train", "validation", "test")
+            }
+            assert all(participants.values())
+            assert participants["train"].isdisjoint(participants["validation"])
+            assert participants["train"].isdisjoint(participants["test"])
+            assert participants["validation"].isdisjoint(participants["test"])
+
+    external_protocol = protocols["external_cough"]
+    assert set(external_protocol.source["dataset"]) == {"coswara"}
+    assert set(external_protocol.target["dataset"]) == {"coughvid"}
+    assert set(external_protocol.target["modality"]) == {"cough"}
+    assert set(external_protocol.target["split"]) == {"external"}
+
+
+def test_track_b_split_summary_does_not_count_test_rows_twice(tmp_path: Path) -> None:
+    project, external, metadata = _track_b_tables()
+    paths = [tmp_path / name for name in ("project.csv", "external.csv", "metadata.csv")]
+    project.to_csv(paths[0], index=False)
+    external.to_csv(paths[1], index=False)
+    metadata.to_csv(paths[2], index=False)
+
+    protocols = build_track_b_protocols(load_track_b_data(*paths))
+
+    for protocol_name in ("existing", "time_stratified", "early_to_late"):
+        protocol = protocols[protocol_name]
+        for modality in ("breath", "cough", "speech"):
+            expected_rows = len(
+                protocol.target[protocol.target["modality"].astype(str).eq(modality)]
+            )
+            summary_rows = protocol.split_summary[
+                protocol.split_summary["modality"].astype(str).eq(modality)
+                & protocol.split_summary["split"].astype(str).eq("test")
+            ]
+            assert len(summary_rows) == 1
+            assert int(summary_rows.iloc[0]["n_rows"]) == expected_rows
+
+
+def test_participant_validation_arrays_average_recordings_without_label_conflict() -> None:
+    labels, probabilities = _participant_validation_arrays(
+        np.array([0, 0, 1, 1], dtype=np.int64),
+        np.array([0.1, 0.3, 0.7, 0.9], dtype=np.float64),
+        np.array(["p0", "p0", "p1", "p1"]),
+    )
+
+    np.testing.assert_array_equal(labels, np.array([0, 1]))
+    np.testing.assert_allclose(probabilities, np.array([0.2, 0.8]))
+
+    with pytest.raises(ValueError, match="conflicting validation labels"):
+        _participant_validation_arrays(
+            np.array([0, 1]),
+            np.array([0.2, 0.8]),
+            np.array(["same", "same"]),
+        )
+
+
+def _canonical_frame_hash(frame: pd.DataFrame) -> str:
+    normalized = frame.copy()
+    for column in normalized.columns:
+        normalized[column] = normalized[column].astype(str)
+    payload = normalized.sort_values(list(normalized.columns)).to_dict(orient="records")
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def test_track_b_loader_rejects_participant_label_conflicts(tmp_path: Path) -> None:
+    project, external, metadata = _track_b_tables()
+    project.loc[project.index[1], "participant_id"] = project.loc[0, "participant_id"]
+    project.loc[project.index[1], "label_binary"] = "positive"
+    project_path = tmp_path / "project.csv"
+    external_path = tmp_path / "external.csv"
+    metadata_path = tmp_path / "metadata.csv"
+    project.to_csv(project_path, index=False)
+    external.to_csv(external_path, index=False)
+    metadata.to_csv(metadata_path, index=False)
+
+    with pytest.raises(ValueError, match="conflicting labels.*participant"):
+        load_track_b_data(project_path, external_path, metadata_path)
+
+
+def test_track_b_loader_requires_exact_ordered_external_features(
+    tmp_path: Path,
+) -> None:
+    project, external, metadata = _track_b_tables()
+    feature_names = [column for column in project if column.startswith("feature_")]
+    external = external[
+        [column for column in external if column not in feature_names]
+        + list(reversed(feature_names))
+    ]
+    paths = [tmp_path / name for name in ("project.csv", "external.csv", "metadata.csv")]
+    project.to_csv(paths[0], index=False)
+    external.to_csv(paths[1], index=False)
+    metadata.to_csv(paths[2], index=False)
+
+    with pytest.raises(ValueError, match="ordered 800 feature columns"):
+        load_track_b_data(*paths)
+
+
+def test_track_b_loader_rejects_infinite_and_all_missing_features(
+    tmp_path: Path, invalid_value: float = float("inf")
+) -> None:
+    project, external, metadata = _track_b_tables()
+    project.loc[0, "feature_000"] = invalid_value
+    project["feature_001"] = np.nan
+    paths = [tmp_path / name for name in ("project.csv", "external.csv", "metadata.csv")]
+    project.to_csv(paths[0], index=False)
+    external.to_csv(paths[1], index=False)
+    metadata.to_csv(paths[2], index=False)
+
+    with pytest.raises(ValueError, match="nonfinite|all-missing"):
+        load_track_b_data(*paths)
+
+
+@pytest.mark.parametrize(
+    ("table_name", "replacement", "message"),
+    [
+        ("project", "another_source", "project.*Coswara"),
+        ("external", "another_source", "external.*COUGHVID"),
+    ],
+)
+def test_track_b_loader_enforces_dataset_identity(
+    tmp_path: Path,
+    table_name: str,
+    replacement: str,
+    message: str,
+) -> None:
+    project, external, metadata = _track_b_tables()
+    if table_name == "project":
+        project["dataset"] = replacement
+    else:
+        external["dataset"] = replacement
+    paths = [tmp_path / name for name in ("project.csv", "external.csv", "metadata.csv")]
+    project.to_csv(paths[0], index=False)
+    external.to_csv(paths[1], index=False)
+    metadata.to_csv(paths[2], index=False)
+
+    with pytest.raises(ValueError, match=message):
+        load_track_b_data(*paths)
+
+
+def test_track_b_checkpoint_input_hash_binds_source_bytes() -> None:
+    feature_hash = _sha("ordered feature names")
+    first = _track_b_checkpoint_input_sha256(
+        feature_hash,
+        {"project": _sha("project-v1"), "external": _sha("external"), "metadata": _sha("metadata")},
+    )
+    second = _track_b_checkpoint_input_sha256(
+        feature_hash,
+        {"project": _sha("project-v2"), "external": _sha("external"), "metadata": _sha("metadata")},
+    )
+
+    assert first != feature_hash
+    assert first != second
+
+
+def test_tuning_never_exceeds_six_trials_and_never_receives_test_rows(
+    tmp_path: Path,
+) -> None:
+    project, external, metadata = _track_b_tables()
+    project_path, external_path, metadata_path = (
+        tmp_path / "project.csv",
+        tmp_path / "external.csv",
+        tmp_path / "metadata.csv",
+    )
+    project.to_csv(project_path, index=False)
+    external.to_csv(external_path, index=False)
+    metadata.to_csv(metadata_path, index=False)
+    data = load_track_b_data(project_path, external_path, metadata_path)
+    protocol = build_track_b_protocols(data)["existing"]
+    observed: list[tuple[set[str], set[str]]] = []
+    target_ids = set(protocol.target["recording_id"].astype(str))
+
+    def evaluate(
+        model_config: ModelConfig,
+        train_config: TrainConfig,
+        training: pd.DataFrame,
+        validation: pd.DataFrame,
+        unit_dir: Path,
+        resume: bool,
+    ) -> dict[str, object]:
+        del train_config, unit_dir, resume
+        observed.append((set(training["split"]), set(validation["split"])))
+        assert target_ids.isdisjoint(training["recording_id"].astype(str))
+        assert target_ids.isdisjoint(validation["recording_id"].astype(str))
+        if model_config.model_name == "dndt":
+            return {"auroc": 0.90, "auprc": 0.70, "threshold": 0.5}
+        return {
+            "auroc": 0.80 + model_config.depth / 1000,
+            "auprc": 0.60 + model_config.num_trees / 1000,
+            "threshold": 0.4,
+        }
+
+    result = select_modality_configuration(
+        protocol,
+        feature_columns=data.feature_columns,
+        feature_sha256=data.feature_sha256,
+        source_sha256=data.source_sha256,
+        modality="cough",
+        max_trials=6,
+        storage=tmp_path / "study.sqlite3",
+        output_dir=tmp_path / "candidates",
+        code_revision="task-5-test-revision",
+        device="cpu",
+        evaluator=evaluate,
+    )
+    assert isinstance(result, CandidateSelectionResult)
+    assert result.completed_trials == 6
+    assert set(result.observed_splits) <= {"train", "validation"}
+    assert result.overall_winner == "dndt"
+    assert result.selected_dndf["model_config"]["model_name"] == "dndf"
+    assert len(observed) == 8
+    assert all(train == {"train"} and validation == {"validation"} for train, validation in observed)
+
+    observed.clear()
+    resumed = select_modality_configuration(
+        protocol,
+        feature_columns=data.feature_columns,
+        feature_sha256=data.feature_sha256,
+        source_sha256=data.source_sha256,
+        modality="cough",
+        max_trials=6,
+        storage=tmp_path / "study.sqlite3",
+        output_dir=tmp_path / "candidates",
+        code_revision="task-5-test-revision",
+        device="cpu",
+        evaluator=evaluate,
+        resume=True,
+    )
+    assert resumed == result
+    assert observed == []
+
+
+def test_validation_tie_triggers_bounded_dndf_tuning(tmp_path: Path) -> None:
+    project, external, metadata = _track_b_tables()
+    paths = [tmp_path / name for name in ("project.csv", "external.csv", "metadata.csv")]
+    project.to_csv(paths[0], index=False)
+    external.to_csv(paths[1], index=False)
+    metadata.to_csv(paths[2], index=False)
+    data = load_track_b_data(*paths)
+    observed_optuna_units: list[str] = []
+
+    def evaluate(
+        model_config: ModelConfig,
+        train_config: TrainConfig,
+        training: pd.DataFrame,
+        validation: pd.DataFrame,
+        unit_dir: Path,
+        resume: bool,
+    ) -> dict[str, object]:
+        del model_config, train_config, training, validation, resume
+        if unit_dir.name.startswith("optuna_"):
+            observed_optuna_units.append(unit_dir.name)
+        return {"auroc": 0.8, "auprc": 0.7, "threshold": 0.5}
+
+    result = select_modality_configuration(
+        build_track_b_protocols(data)["existing"],
+        feature_columns=data.feature_columns,
+        feature_sha256=data.feature_sha256,
+        source_sha256=data.source_sha256,
+        modality="cough",
+        max_trials=1,
+        storage=tmp_path / "tie.sqlite3",
+        output_dir=tmp_path / "candidates",
+        code_revision="tie-test",
+        device="cpu",
+        evaluator=evaluate,
+    )
+
+    assert result.completed_trials == 1
+    assert observed_optuna_units == ["optuna_000"]
+
+
+def test_candidate_receipt_metrics_are_recomputed_from_authenticated_predictions(
+    tmp_path: Path,
+) -> None:
+    unit_dir = tmp_path / "candidate"
+    unit_dir.mkdir()
+    labels = ["negative", "negative", "positive", "positive"]
+    probabilities = [0.1, 0.2, 0.8, 0.9]
+    threshold = best_threshold_by_balanced_accuracy(
+        np.array([0, 0, 1, 1]), np.array(probabilities)
+    )
+    recording = pd.DataFrame(
+        {
+            "recording_id": [f"r{index}" for index in range(4)],
+            "participant_id": [f"p{index}" for index in range(4)],
+            "dataset": ["coswara"] * 4,
+            "modality": ["cough"] * 4,
+            "label_binary": labels,
+            "split": ["validation"] * 4,
+            "probability": probabilities,
+            "threshold": [threshold] * 4,
+            "analysis_unit": ["recording"] * 4,
+            "n_recordings": [1] * 4,
+        }
+    )
+    participant = recording.copy()
+    participant["recording_id"] = participant["participant_id"]
+    participant["analysis_unit"] = "participant"
+    metrics = complete_metric_bundle(
+        np.array([0, 0, 1, 1]), np.array(probabilities), threshold=threshold
+    ) | {"analysis_unit": "participant"}
+    paths = {
+        "recording_predictions": unit_dir / "recording_predictions.csv",
+        "participant_predictions": unit_dir / "participant_predictions.csv",
+        "metrics": unit_dir / "metrics.json",
+        "checkpoint": unit_dir / "checkpoint.bin",
+    }
+    recording.to_csv(paths["recording_predictions"], index=False)
+    participant.to_csv(paths["participant_predictions"], index=False)
+    paths["metrics"].write_text(json.dumps(metrics, sort_keys=True), encoding="utf-8")
+    paths["checkpoint"].write_bytes(b"checkpoint")
+    expected = {"format_version": 1, "status": "complete", "candidate_id": "published"}
+    receipt_path = unit_dir / "completion.json"
+    receipt = {
+        **expected,
+        "validation_metrics": {
+            "auroc": 1.0,
+            "auprc": 1.0,
+            "threshold": threshold,
+        },
+        "artifacts": {
+            name: {"path": str(path), "sha256": checkpoint_sha256(path)}
+            for name, path in paths.items()
+        },
+    }
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
+    assert _load_track_b_candidate_receipt(receipt_path, expected=expected) is not None
+
+    receipt["validation_metrics"]["auroc"] = 0.25
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
+    with pytest.raises(ValueError, match="candidate validation metric is not recomputable"):
+        _load_track_b_candidate_receipt(receipt_path, expected=expected)
+
+
+def test_running_optuna_trial_resumes_same_checkpoint_unit(tmp_path: Path) -> None:
+    import optuna
+
+    project, external, metadata = _track_b_tables()
+    paths = [tmp_path / name for name in ("project.csv", "external.csv", "metadata.csv")]
+    project.to_csv(paths[0], index=False)
+    external.to_csv(paths[1], index=False)
+    metadata.to_csv(paths[2], index=False)
+    data = load_track_b_data(*paths)
+    protocol = build_track_b_protocols(data)["existing"]
+    storage = tmp_path / "resume.sqlite3"
+    study = optuna.create_study(
+        study_name=_track_b_study_name(
+            modality="cough",
+            feature_sha256=data.feature_sha256,
+            split_sha256=protocol.split_sha256,
+            source_sha256=data.source_sha256,
+            code_revision="resume-test",
+        ),
+        storage=f"sqlite:///{storage.as_posix()}",
+        direction="maximize",
+    )
+    trial = study.ask()
+    trial.suggest_int("depth", 5, 11)
+    trial.suggest_categorical("num_trees", [5, 10, 15, 25])
+    trial.suggest_categorical("used_features_rate", [0.4, 0.6, 0.8])
+    trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
+    trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
+    observed: list[tuple[str, bool]] = []
+
+    def evaluate(
+        model_config: ModelConfig,
+        train_config: TrainConfig,
+        training: pd.DataFrame,
+        validation: pd.DataFrame,
+        unit_dir: Path,
+        resume: bool,
+    ) -> dict[str, object]:
+        del train_config, training, validation
+        observed.append((unit_dir.name, resume))
+        score = 0.9 if model_config.model_name == "dndt" else 0.8
+        return {"auroc": score, "auprc": score - 0.1, "threshold": 0.5}
+
+    result = select_modality_configuration(
+        protocol,
+        feature_columns=data.feature_columns,
+        feature_sha256=data.feature_sha256,
+        source_sha256=data.source_sha256,
+        modality="cough",
+        max_trials=1,
+        storage=storage,
+        output_dir=tmp_path / "resume-candidates",
+        code_revision="resume-test",
+        device="cpu",
+        evaluator=evaluate,
+        resume=True,
+    )
+
+    assert result.completed_trials == 1
+    assert ("optuna_000", True) in observed
+    reloaded = optuna.load_study(study_name=study.study_name, storage=study._storage)
+    assert len(reloaded.trials) == 1
+    assert reloaded.trials[0].state == optuna.trial.TrialState.COMPLETE
+
+
+def test_failed_optuna_trials_count_toward_six_attempt_limit(tmp_path: Path) -> None:
+    import optuna
+
+    project, external, metadata = _track_b_tables()
+    paths = [tmp_path / name for name in ("project.csv", "external.csv", "metadata.csv")]
+    project.to_csv(paths[0], index=False)
+    external.to_csv(paths[1], index=False)
+    metadata.to_csv(paths[2], index=False)
+    data = load_track_b_data(*paths)
+    protocol = build_track_b_protocols(data)["existing"]
+    storage = tmp_path / "bounded.sqlite3"
+    study = optuna.create_study(
+        study_name=_track_b_study_name(
+            modality="cough",
+            feature_sha256=data.feature_sha256,
+            split_sha256=protocol.split_sha256,
+            source_sha256=data.source_sha256,
+            code_revision="bounded-test",
+        ),
+        storage=f"sqlite:///{storage.as_posix()}",
+        direction="maximize",
+    )
+    for _ in range(6):
+        study.add_trial(optuna.trial.create_trial(state=optuna.trial.TrialState.FAIL))
+    observed_optuna_units: list[str] = []
+
+    def evaluate(
+        model_config: ModelConfig,
+        train_config: TrainConfig,
+        training: pd.DataFrame,
+        validation: pd.DataFrame,
+        unit_dir: Path,
+        resume: bool,
+    ) -> dict[str, object]:
+        del train_config, training, validation, resume
+        if unit_dir.name.startswith("optuna_"):
+            observed_optuna_units.append(unit_dir.name)
+        score = 0.9 if model_config.model_name == "dndt" else 0.8
+        return {"auroc": score, "auprc": score - 0.1, "threshold": 0.5}
+
+    result = select_modality_configuration(
+        protocol,
+        feature_columns=data.feature_columns,
+        feature_sha256=data.feature_sha256,
+        source_sha256=data.source_sha256,
+        modality="cough",
+        max_trials=6,
+        storage=storage,
+        output_dir=tmp_path / "bounded-candidates",
+        code_revision="bounded-test",
+        device="cpu",
+        evaluator=evaluate,
+    )
+
+    assert result.completed_trials == 0
+    assert observed_optuna_units == []
+    assert len(optuna.load_study(study_name=study.study_name, storage=study._storage).trials) == 6
+
+
+def test_frozen_track_b_lineage_rejects_protocol_specific_override(
+    tmp_path: Path,
+) -> None:
+    del tmp_path
+    selected = {
+        "modality": "cough",
+        "feature_columns": ["a", "b"],
+        "feature_sha256": _sha("features"),
+        "selected_hyperparameters": {
+            "depth": 9,
+            "num_trees": 15,
+            "used_features_rate": 0.6,
+            "learning_rate": 0.001,
+            "weight_decay": 0.0001,
+        },
+    }
+    validated = validate_frozen_track_b_lineage(
+        selected,
+        feature_columns=("a", "b"),
+        feature_sha256=_sha("features"),
+    )
+    assert validated == selected["selected_hyperparameters"]
+    with pytest.raises(ValueError, match="protocol-specific.*override"):
+        validate_frozen_track_b_lineage(
+            selected,
+            feature_columns=("a", "b"),
+            feature_sha256=_sha("features"),
+            configuration_override={"depth": 10},
+        )
+    with pytest.raises(ValueError, match="feature.*lineage"):
+        validate_frozen_track_b_lineage(
+            selected,
+            feature_columns=("b", "a"),
+            feature_sha256=_sha("other"),
+        )
+
+
+def test_track_b_prespecified_ladder_does_not_depend_on_candidates(
+    tmp_path: Path,
+) -> None:
+    config = _track_b_config(tmp_path)
+
+    def evaluate_unit(
+        model_config: ModelConfig,
+        train_config: TrainConfig,
+        training: pd.DataFrame,
+        validation: pd.DataFrame,
+        evaluation: pd.DataFrame,
+        feature_names: tuple[str, ...],
+        unit_dir: Path,
+        resume: bool,
+    ) -> dict[str, object]:
+        del model_config, train_config, training, feature_names, resume
+        checkpoint = unit_dir / "checkpoint.bin"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_bytes(b"prespecified")
+        return {
+            "validation_probability": np.linspace(0.2, 0.8, len(validation)),
+            "evaluation_probability": np.linspace(0.1, 0.9, len(evaluation)),
+            "checkpoint_path": checkpoint,
+            "best_epoch": 1,
+        }
+
+    result = run_track_b(
+        config,
+        run_id="prespecified-without-candidates",
+        stage="prespecified_ladder_v2",
+        modalities=("cough",),
+        protocols=("external_cough",),
+        code_revision="task-5-test-revision",
+        device="cpu",
+        unit_evaluator=evaluate_unit,
+    )
+    assert result["completed_units"] == 1
+
+
+def test_track_b_prespecified_ladder_rejects_incomplete_configuration(
+    tmp_path: Path,
+) -> None:
+    config = _track_b_config(tmp_path)
+    del config["prespecified_ladder_dndf"]["patience"]  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="missing required keys.*patience"):
+        run_track_b(
+            config,
+            run_id="incomplete-prespecified-config",
+            stage="prespecified_ladder_v2",
+            modalities=("cough",),
+            protocols=("external_cough",),
+            code_revision="task-5-test-revision",
+            device="cpu",
+        )
+
+
+def test_track_b_temporal_ladder_rejects_duplicate_full_feature_recordings(
+    tmp_path: Path,
+) -> None:
+    config = _track_b_config(tmp_path)
+    full_path = Path(str(config["project_features_full"]))
+    full = pd.read_csv(full_path)
+    full.loc[1, "recording_id"] = full.loc[0, "recording_id"]
+    full.to_csv(full_path, index=False)
+
+    with pytest.raises(ValueError, match="duplicate recordings"):
+        run_track_b(
+            config,
+            run_id="duplicate-full-recording",
+            stage="prespecified_ladder_v2",
+            modalities=("breath",),
+            protocols=("early_to_late",),
+            code_revision="task-5-test-revision",
+            device="cpu",
+            feature_ranker=_deterministic_feature_ranker,
+        )
+
+
+def test_track_b_rejects_valid_but_nonbest_selected_candidate(tmp_path: Path) -> None:
+    config = _track_b_config(tmp_path)
+    config["selection"]["max_trials_per_modality"] = 2  # type: ignore[index]
+
+    def evaluate(
+        model_config: ModelConfig,
+        train_config: TrainConfig,
+        training: pd.DataFrame,
+        validation: pd.DataFrame,
+        unit_dir: Path,
+        resume: bool,
+    ) -> dict[str, object]:
+        del train_config, training, validation, unit_dir, resume
+        if model_config.model_name == "dndt":
+            return {"auroc": 0.99, "auprc": 0.98, "threshold": 0.5}
+        return {
+            "auroc": 0.70 + model_config.depth / 1000,
+            "auprc": 0.60 + model_config.num_trees / 1000,
+            "threshold": 0.5,
+        }
+
+    run_track_b(
+        config,
+        run_id="best-candidate-auth",
+        stage="candidates",
+        modalities=("breath", "cough", "speech"),
+        code_revision="best-candidate-test",
+        device="cpu",
+        candidate_evaluator=evaluate,
+    )
+    track_b_dir = (
+        Path(str(config["run_root"])) / "best-candidate-auth" / "track_b"
+    )
+    selected_path = track_b_dir / "selected_configurations.json"
+    selected = json.loads(selected_path.read_text(encoding="utf-8"))
+    dndf_receipts = []
+    for receipt_path in (track_b_dir / "candidates" / "cough").glob("*/completion.json"):
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if receipt["model_config"]["model_name"] == "dndf":
+            dndf_receipts.append(receipt)
+    weakest = min(
+        dndf_receipts,
+        key=lambda value: (
+            value["validation_metrics"]["auroc"],
+            value["validation_metrics"]["auprc"],
+        ),
+    )
+    cough = selected["modalities"]["cough"]
+    cough["candidate_id"] = weakest["candidate_id"]
+    cough["model_config"] = weakest["model_config"]
+    cough["train_config"] = weakest["train_config"]
+    cough["validation_metrics"] = weakest["validation_metrics"]
+    cough["selected_configuration_sha256"] = weakest["configuration_sha256"]
+    cough["selected_hyperparameters"] = {
+        "depth": weakest["model_config"]["depth"],
+        "num_trees": weakest["model_config"]["num_trees"],
+        "used_features_rate": weakest["model_config"]["used_features_rate"],
+        "learning_rate": weakest["train_config"]["learning_rate"],
+        "weight_decay": weakest["train_config"]["weight_decay"],
+        "batch_size": weakest["train_config"]["batch_size"],
+        "max_epochs": weakest["train_config"]["max_epochs"],
+        "patience": weakest["train_config"]["patience"],
+        "balance_method": weakest["train_config"]["balance_method"],
+    }
+    selected_path.write_text(json.dumps(selected, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError, match="selected candidate configuration cannot be authenticated"
+    ) as error:
+        run_track_b(
+            config,
+            run_id="best-candidate-auth",
+            stage="final",
+            modalities=("cough",),
+            seeds=(42,),
+            code_revision="best-candidate-test",
+            device="cpu",
+            unit_evaluator=lambda *args, **kwargs: pytest.fail(
+                "execution started from a nonbest candidate"
+            ),
+        )
+    assert "authenticated best candidate" in str(error.value.__cause__)
+
+
+def _track_b_config(tmp_path: Path) -> dict[str, object]:
+    project, external, metadata = _track_b_tables()
+    full_project, _, _ = _track_b_tables(feature_count=805)
+    project_path = tmp_path / "project.csv"
+    full_project_path = tmp_path / "project-full.csv"
+    external_path = tmp_path / "external.csv"
+    metadata_path = tmp_path / "metadata.csv"
+    project.to_csv(project_path, index=False)
+    full_project.to_csv(full_project_path, index=False)
+    external.to_csv(external_path, index=False)
+    metadata.to_csv(metadata_path, index=False)
+    return {
+        "project_features": str(project_path),
+        "project_features_full": str(full_project_path),
+        "external_features": str(external_path),
+        "metadata": str(metadata_path),
+        "run_root": str(tmp_path / "runs"),
+        "device": "cpu",
+        "published": {
+            "depth": 11,
+            "used_features_rate": 0.6,
+            "learning_rate": 0.01,
+            "batch_size": 16,
+            "epochs": 14,
+            "dndt_trees": 1,
+            "dndf_trees": 25,
+        },
+        "selection": {"max_trials_per_modality": 6, "patience": 3},
+        "prespecified_ladder_dndf": {
+            "source": "author_published_configuration",
+            "num_trees": 25,
+            "depth": 11,
+            "used_features_rate": 0.6,
+            "learning_rate": 0.01,
+            "weight_decay": 0.0,
+            "batch_size": 16,
+            "max_epochs": 14,
+            "patience": 3,
+            "balance_method": "smote",
+        },
+        "seeds": {"candidate": [42], "final": [42, 314, 2026]},
+        "modalities": ["breath", "cough", "speech"],
+        "protocols": [
+            "existing",
+            "time_stratified",
+            "early_to_late",
+            "external_cough",
+        ],
+    }
+
+
+def _winning_dndf_candidate_evaluator(
+    model_config: ModelConfig,
+    train_config: TrainConfig,
+    training: pd.DataFrame,
+    validation: pd.DataFrame,
+    unit_dir: Path,
+    resume: bool,
+) -> dict[str, object]:
+    del train_config, training, validation, unit_dir, resume
+    return {
+        "auroc": 0.9 if model_config.model_name == "dndf" else 0.8,
+        "auprc": 0.8 if model_config.model_name == "dndf" else 0.7,
+        "threshold": 0.5,
+    }
+
+
+def _deterministic_feature_ranker(frame: pd.DataFrame) -> pd.DataFrame:
+    features = feature_columns(frame)
+    return pd.DataFrame(
+        {
+            "feature": features,
+            "importance": np.arange(len(features), 0, -1, dtype=float),
+        }
+    )
+
+
+def test_track_b_final_interruption_resume_and_subset_batches_accumulate(
+    tmp_path: Path,
+) -> None:
+    config = _track_b_config(tmp_path)
+    run_track_b(
+        config,
+        run_id="track-b-test",
+        stage="candidates",
+        modalities=("breath", "cough", "speech"),
+        code_revision="task-5-test-revision",
+        device="cpu",
+        candidate_evaluator=_winning_dndf_candidate_evaluator,
+    )
+    calls: list[tuple[str, str, int]] = []
+
+    def evaluate_unit(
+        model_config: ModelConfig,
+        train_config: TrainConfig,
+        training: pd.DataFrame,
+        validation: pd.DataFrame,
+        evaluation: pd.DataFrame,
+        feature_names: tuple[str, ...],
+        unit_dir: Path,
+        resume: bool,
+    ) -> dict[str, object]:
+        del model_config, training, feature_names, resume
+        protocol = "external_cough" if set(evaluation["split"]) == {"external"} else "existing"
+        calls.append((protocol, str(evaluation["modality"].iloc[0]), train_config.seed))
+        checkpoint = unit_dir / "fake-checkpoint.bin"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_bytes(
+            f"{protocol}:{evaluation['modality'].iloc[0]}:{train_config.seed}".encode("ascii")
+        )
+        validation_probability = np.linspace(0.2, 0.8, len(validation))
+        evaluation_probability = np.linspace(0.1, 0.9, len(evaluation))
+        return {
+            "validation_probability": validation_probability,
+            "evaluation_probability": evaluation_probability,
+            "checkpoint_path": checkpoint,
+            "best_epoch": 1,
+        }
+
+    with pytest.raises(PlannedInterruption, match="durable Track B receipt"):
+        run_track_b(
+            config,
+            run_id="track-b-test",
+            stage="final",
+            modalities=("breath",),
+            seeds=(42,),
+            code_revision="task-5-test-revision",
+            device="cpu",
+            unit_evaluator=evaluate_unit,
+            interrupt_after_receipt=("final", "existing", "breath", "dndf", 42),
+        )
+    assert calls == [("existing", "breath", 42)]
+
+    partial = run_track_b(
+        config,
+        run_id="track-b-test",
+        stage="final",
+        modalities=("breath", "cough", "speech"),
+        seeds=(42,),
+        resume=True,
+        code_revision="task-5-test-revision",
+        device="cpu",
+        unit_evaluator=evaluate_unit,
+    )
+    assert partial["status"] == "partial"
+    assert partial["completed_units"] == 3
+    assert calls.count(("existing", "breath", 42)) == 1
+
+    complete = run_track_b(
+        config,
+        run_id="track-b-test",
+        stage="final",
+        modalities=("breath", "cough", "speech"),
+        seeds=(314, 2026),
+        resume=True,
+        code_revision="task-5-test-revision",
+        device="cpu",
+        unit_evaluator=evaluate_unit,
+    )
+    assert complete["status"] == "complete"
+    assert complete["completed_units"] == complete["total_units"] == 9
+    assert complete["modalities"] == ["breath", "cough", "speech"]
+    assert complete["protocols"] == ["existing"]
+    assert complete["seeds"] == [42, 314, 2026]
+    assert complete["requested_scope"] == {
+        "modalities": ["breath", "cough", "speech"],
+        "protocols": ["existing"],
+        "seeds": [314, 2026],
+    }
+    aggregate = pd.read_csv(
+        Path(str(config["run_root"]))
+        / "track-b-test"
+        / "track_b"
+        / "final_participant_predictions.csv"
+    )
+    assert set(aggregate["seed"]) == {42, 314, 2026}
+    assert set(aggregate["modality"]) == {"breath", "cough", "speech"}
+    track_b_dir = Path(str(config["run_root"])) / "track-b-test" / "track_b"
+    metrics = pd.read_csv(track_b_dir / "final_metrics.csv")
+    metric = metrics.loc[
+        metrics["seed"].eq(42)
+        & metrics["modality"].eq("breath")
+        & metrics["model_name"].eq("dndf")
+    ].iloc[0]
+    metric_predictions = aggregate.loc[
+        aggregate["seed"].eq(42)
+        & aggregate["modality"].eq("breath")
+        & aggregate["model_name"].eq("dndf")
+        & aggregate["split"].eq("test")
+    ]
+    _assert_complete_metrics_match_predictions(metric, metric_predictions)
+
+
+def test_track_b_ladder_protocol_batches_accumulate_and_external_is_source_isolated(
+    tmp_path: Path,
+) -> None:
+    config = _track_b_config(tmp_path)
+    run_track_b(
+        config,
+        run_id="track-b-ladder",
+        stage="candidates",
+        modalities=("breath", "cough", "speech"),
+        code_revision="task-5-test-revision",
+        device="cpu",
+        candidate_evaluator=_winning_dndf_candidate_evaluator,
+    )
+    observed: list[tuple[set[str], set[str], set[str]]] = []
+
+    def evaluate_unit(
+        model_config: ModelConfig,
+        train_config: TrainConfig,
+        training: pd.DataFrame,
+        validation: pd.DataFrame,
+        evaluation: pd.DataFrame,
+        feature_names: tuple[str, ...],
+        unit_dir: Path,
+        resume: bool,
+    ) -> dict[str, object]:
+        del model_config, train_config, feature_names, resume
+        observed.append(
+            (set(training["dataset"]), set(validation["dataset"]), set(evaluation["dataset"]))
+        )
+        checkpoint = unit_dir / "fake-checkpoint.bin"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_bytes(b"checkpoint")
+        return {
+            "validation_probability": np.linspace(0.2, 0.8, len(validation)),
+            "evaluation_probability": np.linspace(0.1, 0.9, len(evaluation)),
+            "checkpoint_path": checkpoint,
+            "best_epoch": 1,
+        }
+
+    partial = run_track_b(
+        config,
+        run_id="track-b-ladder",
+        stage="prespecified_ladder_v2",
+        modalities=("breath",),
+        protocols=("early_to_late",),
+        code_revision="task-5-test-revision",
+        device="cpu",
+        unit_evaluator=evaluate_unit,
+        feature_ranker=_deterministic_feature_ranker,
+    )
+    assert partial["status"] == "partial"
+    assert partial["completed_units"] == 3
+
+    complete = run_track_b(
+        config,
+        run_id="track-b-ladder",
+        stage="prespecified_ladder_v2",
+        modalities=("breath", "cough", "speech"),
+        protocols=(
+            "early_to_late",
+            "existing",
+            "external_cough",
+            "time_stratified",
+        ),
+        resume=True,
+        code_revision="task-5-test-revision",
+        device="cpu",
+        unit_evaluator=evaluate_unit,
+        feature_ranker=_deterministic_feature_ranker,
+    )
+    assert complete["status"] == "complete"
+    assert complete["completed_units"] == complete["total_units"] == 28
+    assert ({"coswara"}, {"coswara"}, {"coughvid"}) in observed
+
+
+def test_track_b_ladder_uses_protocol_train_only_features_and_published_config(
+    tmp_path: Path,
+) -> None:
+    config = _track_b_config(tmp_path)
+    run_track_b(
+        config,
+        run_id="leakage-safe-ladder",
+        stage="candidates",
+        modalities=("breath", "cough", "speech"),
+        code_revision="leakage-safe-ladder-test",
+        device="cpu",
+        candidate_evaluator=_winning_dndf_candidate_evaluator,
+    )
+    ranked_participants: list[set[str]] = []
+    observed_configs: list[tuple[int, int, float, float, int, int]] = []
+
+    def rank_training_only(frame: pd.DataFrame) -> pd.DataFrame:
+        assert set(frame["split"].astype(str)) == {"train"}
+        ranked_participants.append(set(frame["participant_id"].astype(str)))
+        features = feature_columns(frame)
+        assert len(features) == 805
+        features = (features[-1], *features[:-1])
+        return pd.DataFrame(
+            {
+                "feature": features,
+                "importance": np.arange(len(features), 0, -1, dtype=float),
+            }
+        )
+
+    def evaluate_unit(
+        model_config: ModelConfig,
+        train_config: TrainConfig,
+        training: pd.DataFrame,
+        validation: pd.DataFrame,
+        evaluation: pd.DataFrame,
+        feature_names: tuple[str, ...],
+        unit_dir: Path,
+        resume: bool,
+    ) -> dict[str, object]:
+        del resume
+        assert ranked_participants[-1].isdisjoint(
+            set(evaluation["participant_id"].astype(str))
+        )
+        assert len(feature_names) == 800
+        observed_configs.append(
+            (
+                model_config.num_trees,
+                model_config.depth,
+                model_config.used_features_rate,
+                train_config.learning_rate,
+                train_config.batch_size,
+                train_config.max_epochs,
+            )
+        )
+        checkpoint = unit_dir / "checkpoint.bin"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_bytes(b"leakage-safe")
+        return {
+            "validation_probability": np.linspace(0.2, 0.8, len(validation)),
+            "evaluation_probability": np.linspace(0.1, 0.9, len(evaluation)),
+            "checkpoint_path": checkpoint,
+            "best_epoch": 1,
+        }
+
+    result = run_track_b(
+        config,
+        run_id="leakage-safe-ladder",
+        stage="prespecified_ladder_v2",
+        modalities=("breath",),
+        protocols=("early_to_late",),
+        code_revision="leakage-safe-ladder-test",
+        device="cpu",
+        unit_evaluator=evaluate_unit,
+        feature_ranker=rank_training_only,
+    )
+
+    assert result["status"] == "partial"
+    assert len(ranked_participants) == 1
+    assert set(observed_configs) == {(25, 11, 0.6, 0.01, 16, 14)}
+    receipt_path = (
+        Path(str(config["run_root"]))
+        / "leakage-safe-ladder"
+        / "track_b"
+        / "units"
+        / "prespecified_ladder_v2"
+        / "early_to_late"
+        / "breath"
+        / "dndf"
+        / "seed_42"
+        / "completion.json"
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert (
+        receipt["configuration_selection_source"]
+        == "author_published_configuration"
+    )
+    assert receipt["feature_selection_scope"] == "protocol_train_only"
+    assert len(receipt["feature_selection_artifact_sha256"]) == 64
+    assert "feature_804" in receipt["feature_columns"]
+    assert "feature_799" not in receipt["feature_columns"]
+
+
+def test_track_b_temporal_default_evaluator_accepts_protocol_source_hashes(
+    tmp_path: Path,
+) -> None:
+    config = _track_b_config(tmp_path)
+    result = run_track_b(
+        config,
+        run_id="temporal-default-evaluator",
+        stage="prespecified_ladder_v2",
+        smoke=True,
+        modalities=("breath",),
+        protocols=("early_to_late",),
+        code_revision="task-5-production-path-test",
+        device="cpu",
+        feature_ranker=_deterministic_feature_ranker,
+    )
+    assert result["completed_units"] == 3
+
+
+def test_track_b_shuffle_retrains_dndf_with_source_only_participant_permutation(
+    tmp_path: Path,
+) -> None:
+    config = _track_b_config(tmp_path)
+    data = load_track_b_data(
+        str(config["project_features"]),
+        str(config["external_features"]),
+        str(config["metadata"]),
+    )
+    existing = build_track_b_protocols(data)["existing"]
+    shuffled = _build_track_b_shuffle_protocol(existing, seed=42)
+    assert shuffled.name == "shuffle"
+    assert shuffled.target["label_binary"].tolist() == existing.target[
+        "label_binary"
+    ].tolist()
+    for split in ("train", "validation"):
+        original = (
+            existing.source.loc[existing.source["split"].eq(split)]
+            .groupby("participant_id")["label_binary"]
+            .first()
+            .sort_index()
+        )
+        permuted = (
+            shuffled.source.loc[shuffled.source["split"].eq(split)]
+            .groupby("participant_id")["label_binary"]
+            .first()
+            .sort_index()
+        )
+        assert original.value_counts().to_dict() == permuted.value_counts().to_dict()
+    assert any(
+        existing.source["label_binary"].astype(str).ne(
+            shuffled.source["label_binary"].astype(str)
+        )
+    )
+
+    run_track_b(
+        config,
+        run_id="shuffle-run",
+        stage="candidates",
+        modalities=("breath", "cough", "speech"),
+        code_revision="shuffle-test-revision",
+        device="cpu",
+        candidate_evaluator=_winning_dndf_candidate_evaluator,
+    )
+    observed: list[tuple[str, int, set[str], set[str]]] = []
+
+    def evaluate_unit(
+        model_config: ModelConfig,
+        train_config: TrainConfig,
+        training: pd.DataFrame,
+        validation: pd.DataFrame,
+        evaluation: pd.DataFrame,
+        feature_names: tuple[str, ...],
+        unit_dir: Path,
+        resume: bool,
+    ) -> dict[str, object]:
+        del feature_names, resume
+        observed.append(
+            (
+                model_config.model_name,
+                train_config.seed,
+                set(training["split"].astype(str)),
+                set(evaluation["split"].astype(str)),
+            )
+        )
+        checkpoint = unit_dir / "shuffle-checkpoint.bin"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_bytes(b"shuffle")
+        return {
+            "validation_probability": np.linspace(0.2, 0.8, len(validation)),
+            "evaluation_probability": np.linspace(0.1, 0.9, len(evaluation)),
+            "checkpoint_path": checkpoint,
+            "best_epoch": 1,
+        }
+
+    result = run_track_b(
+        config,
+        run_id="shuffle-run",
+        stage="shuffle",
+        modalities=("breath", "cough", "speech"),
+        code_revision="shuffle-test-revision",
+        device="cpu",
+        unit_evaluator=evaluate_unit,
+    )
+    assert result["status"] == "complete"
+    assert result["completed_units"] == result["total_units"] == 3
+    assert observed == [
+        ("dndf", 42, {"train"}, {"test"}),
+        ("dndf", 42, {"train"}, {"test"}),
+        ("dndf", 42, {"train"}, {"test"}),
+    ]
+    predictions = pd.read_csv(
+        Path(str(config["run_root"]))
+        / "shuffle-run"
+        / "track_b"
+        / "shuffle_participant_predictions.csv"
+    )
+    assert set(predictions["protocol"]) == {"shuffle"}
+    assert set(predictions.loc[predictions["split"].eq("test"), "label_binary"]) == {
+        "negative",
+        "positive",
+    }
+
+
+def test_track_b_candidate_batch_rejects_tampered_prior_selected_receipt(
+    tmp_path: Path,
+) -> None:
+    config = _track_b_config(tmp_path)
+    run_track_b(
+        config,
+        run_id="candidate-auth",
+        stage="candidates",
+        modalities=("breath",),
+        code_revision="task-5-test-revision",
+        device="cpu",
+        candidate_evaluator=_winning_dndf_candidate_evaluator,
+    )
+    receipt_path = (
+        Path(str(config["run_root"]))
+        / "candidate-auth"
+        / "track_b"
+        / "candidates"
+        / "breath"
+        / "published_dndf"
+        / "completion.json"
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["validation_metrics"]["auroc"] = 0.1
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="selected candidate.*receipt|authenticated"):
+        run_track_b(
+            config,
+            run_id="candidate-auth",
+            stage="candidates",
+            modalities=("cough",),
+            resume=True,
+            code_revision="task-5-test-revision",
+            device="cpu",
+            candidate_evaluator=_winning_dndf_candidate_evaluator,
+        )
+
+
+def test_external_cough_target_values_never_reach_fit_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import covid_rars.dndt_dndf_experiment as experiment
+
+    config = _track_b_config(tmp_path)
+    external_path = Path(str(config["external_features"]))
+    external = pd.read_csv(external_path)
+    external["feature_000"] += 10_000.0
+    external.to_csv(external_path, index=False)
+    loaded = load_track_b_data(
+        str(config["project_features"]),
+        str(config["external_features"]),
+        str(config["metadata"]),
+    )
+    expected_checkpoint_input = _track_b_checkpoint_input_sha256(
+        loaded.feature_sha256, loaded.source_sha256
+    )
+    run_track_b(
+        config,
+        run_id="external-spy",
+        stage="candidates",
+        modalities=("breath", "cough", "speech"),
+        code_revision="task-5-test-revision",
+        device="cpu",
+        candidate_evaluator=_winning_dndf_candidate_evaluator,
+    )
+    fit_observations: list[tuple[float, float]] = []
+
+    def fit_spy(
+        training_features: object,
+        training_labels: object,
+        validation_features: object,
+        validation_labels: object,
+        **kwargs: object,
+    ) -> FitResult:
+        del training_labels, validation_labels
+        training = np.asarray(training_features, dtype=float)
+        validation = np.asarray(validation_features, dtype=float)
+        fit_observations.append((float(training[:, 0].max()), float(validation[:, 0].max())))
+        assert training[:, 0].max() < 10_000
+        assert validation[:, 0].max() < 10_000
+        assert kwargs["input_feature_hash"] == expected_checkpoint_input
+        assert len(np.asarray(kwargs["validation_group_ids"])) == len(validation)
+        checkpoint = Path(str(kwargs["checkpoint_dir"])) / "spy-checkpoint.bin"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_bytes(b"source-only-fit")
+        return FitResult(
+            best_epoch=1,
+            validation_auroc=0.5,
+            validation_auprc=0.5,
+            threshold=0.5,
+            checkpoint_path=checkpoint,
+            validation_probability=np.linspace(0.2, 0.8, len(validation)),
+        )
+
+    def inference_spy(
+        checkpoint_dir: Path,
+        features: np.ndarray,
+        **kwargs: object,
+    ) -> tuple[np.ndarray, Path, str]:
+        del kwargs
+        assert features[:, 0].min() >= 10_000
+        checkpoint = checkpoint_dir / "spy-checkpoint.bin"
+        return (
+            np.linspace(0.1, 0.9, len(features)),
+            checkpoint,
+            checkpoint_sha256(checkpoint),
+        )
+
+    monkeypatch.setattr(experiment, "fit_model", fit_spy)
+    monkeypatch.setattr(experiment, "_track_b_inference_probabilities", inference_spy)
+    result = run_track_b(
+        config,
+        run_id="external-spy",
+        stage="prespecified_ladder_v2",
+        modalities=("cough",),
+        protocols=("external_cough",),
+        code_revision="task-5-test-revision",
+        device="cpu",
+    )
+    assert result["completed_units"] == 1
+    assert fit_observations and all(maximum < 10_000 for pair in fit_observations for maximum in pair)
+
+
+@pytest.mark.parametrize("tamper", ["backend", "checkpoint", "output_identity"])
+def test_track_b_execution_rejects_cross_backend_or_tampered_checkpoint(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    config = _track_b_config(tmp_path)
+    run_track_b(
+        config,
+        run_id=f"execution-tamper-{tamper}",
+        stage="candidates",
+        modalities=("breath", "cough", "speech"),
+        code_revision="task-5-test-revision",
+        device="cpu",
+        candidate_evaluator=_winning_dndf_candidate_evaluator,
+    )
+
+    def evaluate_unit(
+        model_config: ModelConfig,
+        train_config: TrainConfig,
+        training: pd.DataFrame,
+        validation: pd.DataFrame,
+        evaluation: pd.DataFrame,
+        feature_names: tuple[str, ...],
+        unit_dir: Path,
+        resume: bool,
+    ) -> dict[str, object]:
+        del model_config, train_config, training, feature_names, resume
+        checkpoint = unit_dir / "checkpoint.bin"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_bytes(b"original")
+        return {
+            "validation_probability": np.linspace(0.2, 0.8, len(validation)),
+            "evaluation_probability": np.linspace(0.1, 0.9, len(evaluation)),
+            "checkpoint_path": checkpoint,
+            "best_epoch": 1,
+        }
+
+    run_track_b(
+        config,
+        run_id=f"execution-tamper-{tamper}",
+        stage="final",
+        modalities=("breath",),
+        seeds=(42,),
+        code_revision="task-5-test-revision",
+        device="cpu",
+        unit_evaluator=evaluate_unit,
+    )
+    unit_dir = (
+        Path(str(config["run_root"]))
+        / f"execution-tamper-{tamper}"
+        / "track_b"
+        / "units"
+        / "final"
+        / "existing"
+        / "breath"
+        / "dndf"
+        / "seed_42"
+    )
+    if tamper == "backend":
+        receipt_path = unit_dir / "completion.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["execution_backend"] = "cuda:0"
+        receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
+        message = "execution_backend mismatch"
+    else:
+        if tamper == "checkpoint":
+            (unit_dir / "checkpoint.bin").write_bytes(b"tampered")
+            message = "artifact is missing or tampered"
+        else:
+            receipt_path = unit_dir / "completion.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            for artifact_name in ("recording_predictions", "participant_predictions"):
+                prediction_path = Path(receipt["artifacts"][artifact_name]["path"])
+                predictions = pd.read_csv(prediction_path)
+                predictions["protocol"] = "tampered_protocol"
+                predictions.to_csv(prediction_path, index=False)
+                receipt["artifacts"][artifact_name]["sha256"] = checkpoint_sha256(
+                    prediction_path
+                )
+            receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
+            message = "prediction provenance"
+    with pytest.raises(ValueError, match=message):
+        run_track_b(
+            config,
+            run_id=f"execution-tamper-{tamper}",
+            stage="final",
+            modalities=("breath",),
+            seeds=(42,),
+            resume=True,
+            code_revision="task-5-test-revision",
+            device="cpu",
+            unit_evaluator=evaluate_unit,
+        )
+
+
+def test_track_b_smoke_tuning_cannot_escape_tiny_model_limits(
+    tmp_path: Path,
+) -> None:
+    observed: list[tuple[ModelConfig, TrainConfig]] = []
+
+    def evaluate(
+        model_config: ModelConfig,
+        train_config: TrainConfig,
+        training: pd.DataFrame,
+        validation: pd.DataFrame,
+        unit_dir: Path,
+        resume: bool,
+    ) -> dict[str, object]:
+        del training, validation, unit_dir, resume
+        observed.append((model_config, train_config))
+        return {
+            "auroc": 0.9 if model_config.model_name == "dndt" else 0.8,
+            "auprc": 0.7,
+            "threshold": 0.5,
+        }
+
+    result = run_track_b(
+        {
+            "run_root": str(tmp_path / "runs"),
+            "device": "cpu",
+            "selection": {"max_trials_per_modality": 6, "patience": 3},
+            "modalities": ["breath", "cough", "speech"],
+            "seeds": {"candidate": [42], "final": [42, 314, 2026]},
+        },
+        run_id="smoke-limits",
+        stage="candidates",
+        modalities=("breath",),
+        code_revision="task-5-test-revision",
+        device="cpu",
+        smoke=True,
+        candidate_evaluator=evaluate,
+    )
+    assert result["status"] == "partial"
+    dndf = [(model, train) for model, train in observed if model.model_name == "dndf"]
+    assert len(dndf) == 7
+    assert all(model.depth == 2 and model.num_trees == 2 for model, _ in dndf)
+    assert all(train.max_epochs == 2 for _, train in dndf)
 
 
 def test_train_config_and_fit_result_are_frozen_and_validate_contract() -> None:
@@ -1360,6 +3130,24 @@ def test_rfecv_cache_is_global_hashed_and_recomputed_after_corruption(
     assert not list(first.manifest_path.parent.glob("*.tmp"))
 
 
+def test_track_a_rfecv_exposure_quantifies_released_outer_test_visibility() -> None:
+    audit = track_a_rfecv_outer_test_exposure(_tiny_track_a_artifacts())
+
+    assert audit["fold"].tolist() == [0, 1, 2]
+    assert audit["n_outer_test"].tolist() == [20, 20, 20]
+    assert audit["n_outer_test_in_rfecv_training"].tolist() == [16, 18, 14]
+    assert audit["outer_test_exposed_fraction"].tolist() == pytest.approx(
+        [0.8, 0.9, 0.7]
+    )
+    assert audit["exposed_author_positive"].tolist() == [8, 9, 8]
+    assert audit["exposed_author_negative"].tolist() == [8, 9, 6]
+    assert audit["rfecv_selection_train_n"].eq(48).all()
+    assert audit["rfecv_selection_holdout_n"].eq(12).all()
+    assert audit["selection_random_state"].eq(42).all()
+    assert audit["selection_test_fraction"].eq(0.20).all()
+    assert audit["selection_scope"].eq("single_global_author_pass").all()
+
+
 @pytest.mark.parametrize(
     "corruption",
     (
@@ -1781,7 +3569,11 @@ def test_track_a_modes_record_identity_threshold_and_training_order_contracts(
         artifacts=artifacts,
         feature_cache=cache,
         fold_batch=(0, 1),
-        modes=("author_behaviour_audit", "corrected_reference"),
+        modes=(
+            "author_behaviour_audit",
+            "fresh_fold_author_protocol",
+            "corrected_reference",
+        ),
         model_names=("dndt",),
         code_revision="task4-test",
         device="cpu",
@@ -1789,12 +3581,20 @@ def test_track_a_modes_record_identity_threshold_and_training_order_contracts(
 
     author_ids = [(model, optimizer) for mode, model, optimizer in identities if mode == "author_behaviour_audit"]
     corrected_ids = [(model, optimizer) for mode, model, optimizer in identities if mode == "corrected_reference"]
+    fresh_ids = [
+        (model, optimizer)
+        for mode, model, optimizer in identities
+        if mode == "fresh_fold_author_protocol"
+    ]
     assert len(author_ids) == 1
+    assert len(fresh_ids) == 2
+    assert len(set(fresh_ids)) == 2
     assert len(corrected_ids) == 2
     assert len(set(corrected_ids)) == 2
     rows = pd.DataFrame(result["metrics"])
     author = rows[rows["mode"] == "author_behaviour_audit"]
     corrected = rows[rows["mode"] == "corrected_reference"]
+    fresh = rows[rows["mode"] == "fresh_fold_author_protocol"]
     assert author["threshold_source"].eq("test_balanced_accuracy_author_audit").all()
     assert author["threshold_selected_on_outer_test"].eq(True).all()
     assert author["model_reinitialized_per_fold"].eq(False).all()
@@ -1802,6 +3602,12 @@ def test_track_a_modes_record_identity_threshold_and_training_order_contracts(
     assert author["author_training_order"].eq("no_shuffle_repeated_dataset").all()
     assert author["author_randomness_unseeded"].eq(True).all()
     assert author["reconstruction_seed"].eq(42).all()
+    assert fresh["threshold_source"].eq("test_balanced_accuracy_author_audit").all()
+    assert fresh["threshold_selected_on_outer_test"].eq(True).all()
+    assert fresh["model_reinitialized_per_fold"].eq(True).all()
+    assert fresh["optimizer_reinitialized_per_fold"].eq(True).all()
+    assert fresh["author_training_order"].eq("no_shuffle_repeated_dataset").all()
+    assert fresh["reconstruction_seed"].tolist() == [42, 43]
     assert corrected["threshold_source"].eq("inner_validation_balanced_accuracy").all()
     assert corrected["threshold_selected_on_outer_test"].eq(False).all()
     assert corrected["model_reinitialized_per_fold"].eq(True).all()
@@ -1813,11 +3619,32 @@ def test_track_a_modes_record_identity_threshold_and_training_order_contracts(
     corrected_predictions = predictions[
         predictions["mode"] == "corrected_reference"
     ]
+    fresh_predictions = predictions[
+        predictions["mode"] == "fresh_fold_author_protocol"
+    ]
     assert author_predictions["threshold_comparator"].eq("gt").all()
     assert corrected_predictions["threshold_comparator"].eq("ge").all()
+    assert fresh_predictions["threshold_comparator"].eq("gt").all()
     assert predictions["execution_backend"].eq("cpu").all()
     assert rows["execution_backend"].eq("cpu").all()
     run_dir = tmp_path / "runs" / "identity-contract"
+    manifest = json.loads(
+        (run_dir / "track_a_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["track"] == "A"
+    assert all(
+        set(descriptor) == {"path", "sha256"}
+        for descriptor in manifest["authenticated_receipts"]
+    )
+    assert set(manifest["artifacts"]) == {
+        "predictions",
+        "metrics",
+        "rfecv_outer_test_exposure",
+    }
+    exposure_descriptor = manifest["artifacts"]["rfecv_outer_test_exposure"]
+    exposure_path = run_dir / exposure_descriptor["path"]
+    assert exposure_path.name == "track_a_rfecv_outer_test_exposure.csv"
+    assert exposure_descriptor["sha256"] == checkpoint_sha256(exposure_path)
     for receipt_path in run_dir.rglob("receipt.json"):
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         assert receipt["execution_backend"] == "cpu"
@@ -2064,6 +3891,54 @@ def test_author_fold_batch_resume_matches_uninterrupted_and_writes_atomic_receip
     )
     with pytest.raises(ValueError, match="authenticated receipt chain.*invalid"):
         run_track_a(config, run_id="resumed", resume=True, **common)
+
+
+def test_author_models_resume_independently_when_requested_batch_expands(
+    tmp_path: Path,
+) -> None:
+    artifacts = _tiny_track_a_artifacts()
+    full_root = tmp_path / "full"
+    resumed_root = tmp_path / "resumed"
+    common = {
+        "artifacts": artifacts,
+        "modes": ("author_behaviour_audit",),
+        "model_names": ("dndt", "dndf"),
+        "code_revision": "track-a-expanded-batch-test",
+        "device": "cpu",
+    }
+    full = run_track_a(
+        _tiny_track_a_config(full_root),
+        run_id="expanded",
+        feature_cache=_tiny_track_a_cache(full_root),
+        fold_batch=(0, 1, 2),
+        **common,
+    )
+
+    with pytest.raises(PlannedInterruption):
+        run_track_a(
+            _tiny_track_a_config(resumed_root),
+            run_id="expanded",
+            feature_cache=_tiny_track_a_cache(resumed_root),
+            fold_batch=(0, 1),
+            interrupt_after=("author_behaviour_audit", "dndf", 0, 1),
+            **common,
+        )
+    resumed = run_track_a(
+        _tiny_track_a_config(resumed_root),
+        run_id="expanded",
+        feature_cache=_tiny_track_a_cache(resumed_root),
+        fold_batch=(0, 1, 2),
+        resume=True,
+        **common,
+    )
+
+    full_predictions = pd.DataFrame(full["predictions"]).sort_values(
+        ["model_name", "fold", "analysis_id"], kind="stable"
+    ).reset_index(drop=True)
+    resumed_predictions = pd.DataFrame(resumed["predictions"]).sort_values(
+        ["model_name", "fold", "analysis_id"], kind="stable"
+    ).reset_index(drop=True)
+    pd.testing.assert_frame_equal(full_predictions, resumed_predictions)
 
 
 def test_author_receipt_crash_resume_never_repeats_outer_test_evaluation(
@@ -2391,6 +4266,35 @@ def test_completed_fold_resume_rejects_tampered_output_identity_even_with_new_ha
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
 
     with pytest.raises(ValueError, match="authenticated fold"):
+        _resume_copied_corrected_track_a(config, artifacts, cache)
+
+
+def test_completed_fold_resume_recomputes_metrics_from_saved_predictions(
+    tmp_path: Path,
+    completed_corrected_track_a_template: tuple[
+        Path,
+        AuthorTrackAArtifacts,
+        TrackAFeatureCache,
+        dict[str, object],
+    ],
+) -> None:
+    run_dir, artifacts, cache, config = _copied_corrected_track_a_case(
+        tmp_path,
+        completed_corrected_track_a_template,
+    )
+    fold_dir = (
+        run_dir / "track_a" / "corrected_reference" / "dndt" / "fold_00"
+    )
+    metrics_path = fold_dir / "metrics.json"
+    receipt_path = fold_dir / "receipt.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics["auroc"] = 0.123456789
+    metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["metrics_sha256"] = checkpoint_sha256(metrics_path)
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="metric recomputation mismatch"):
         _resume_copied_corrected_track_a(config, artifacts, cache)
 
 
