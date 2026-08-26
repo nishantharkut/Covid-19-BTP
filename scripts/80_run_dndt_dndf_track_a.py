@@ -17,6 +17,15 @@ if str(SOURCE_ROOT) not in sys.path:
 from covid_rars.dndt_dndf_experiment import run_track_a
 
 
+class CliArgumentError(ValueError):
+    """Raised when CLI syntax or a CLI-only value is invalid."""
+
+
+class MachineReadableArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise CliArgumentError(message)
+
+
 def parse_fold_batch(value: str | None) -> tuple[int, ...]:
     if value is None:
         return tuple(range(10))
@@ -52,7 +61,7 @@ def parse_fold_batch(value: str | None) -> tuple[int, ...]:
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = MachineReadableArgumentParser(
         description="Run the auditable DNDT/DNDF author-artifact reproduction."
     )
     parser.add_argument("--config", type=Path, required=True)
@@ -90,7 +99,10 @@ def main(
         config = json.loads(args.config.read_text(encoding="utf-8"))
         if not isinstance(config, dict):
             raise ValueError("configuration root must be a JSON object")
-        folds = parse_fold_batch(args.fold_batch)
+        try:
+            folds = parse_fold_batch(args.fold_batch)
+        except ValueError as exc:
+            raise CliArgumentError(str(exc)) from exc
         run_id = f"{args.run_id}-smoke" if args.smoke else args.run_id
         if args.smoke:
             folds = (folds[0],)

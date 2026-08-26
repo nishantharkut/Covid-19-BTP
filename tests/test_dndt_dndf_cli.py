@@ -691,6 +691,46 @@ def test_track_a_fold_batch_parser_and_cli_smoke_are_machine_readable(
     assert json.loads(capsys.readouterr().out)["status"] == "complete"
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ("--config", "{config}"),
+        ("--config", "{config}", "--run-id", "bad-range", "--fold-batch", "x-y"),
+        ("--config", "{config}", "--run-id", "out-of-range", "--fold-batch", "0,10"),
+        ("--config", "{config}", "--run-id", "bad-device", "--device", "quantum"),
+    ),
+)
+def test_track_a_cli_parser_failures_use_one_machine_readable_envelope(
+    tmp_path: Path,
+    arguments: tuple[str, ...],
+) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}\n", encoding="utf-8")
+    resolved = tuple(
+        str(config_path) if argument == "{config}" else argument
+        for argument in arguments
+    )
+    process = subprocess.run(
+        [
+            sys.executable,
+            str(PROJECT_ROOT / "scripts" / "80_run_dndt_dndf_track_a.py"),
+            *resolved,
+        ],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert process.returncode != 0
+    assert process.stderr == ""
+    envelope = json.loads(process.stdout)
+    assert envelope["status"] == "failed"
+    assert envelope["error_type"] == "CliArgumentError"
+    assert isinstance(envelope["message"], str) and envelope["message"]
+    assert set(envelope) == {"status", "error_type", "message"}
+
+
 def test_author_mode_rejects_late_fold_batch_without_preceding_state(
     tmp_path: Path,
 ) -> None:

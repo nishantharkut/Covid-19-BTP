@@ -97,7 +97,15 @@ PREDICTION_COLUMNS = (
     "feature_sha256",
     "checkpoint_sha256",
 )
-_TRACK_A_COLUMNS = ("analysis_id", "analysis_unit")
+_TRACK_A_COLUMNS = (
+    "analysis_id",
+    "analysis_unit",
+    "mode",
+    "author_commit",
+    "feature_indices_sha256",
+    "feature_cache_key",
+    "code_revision",
+)
 
 
 @dataclass(frozen=True)
@@ -179,6 +187,28 @@ class TrackAFeatureCache:
     selected_features_sha256: str
     selected_indices_sha256: str
     manifest_path: Path
+
+
+@dataclass(frozen=True)
+class TrackAFoldContext:
+    run_id: str
+    mode: str
+    fold: int
+    model_name: str
+    author_commit: str
+    feature_sha256: str
+    feature_indices_sha256: str
+    feature_cache_key: str
+    configuration_sha256: str
+    split_sha256: str
+    code_revision: str
+    threshold_source: str
+    checkpoint_path: Path
+    checkpoint_sha256: str
+
+    @property
+    def protocol(self) -> str:
+        return f"author_released_10fold_{self.mode}"
 
 
 class PlannedInterruption(RuntimeError):
@@ -618,6 +648,7 @@ def _track_a_rfecv_payload(artifacts: AuthorTrackAArtifacts) -> dict[str, object
 def _load_valid_track_a_cache(
     cache_dir: Path,
     *,
+    expected_payload: Mapping[str, object],
     cache_key: str,
     expected_rows: int,
     expected_indices: np.ndarray | None,
@@ -627,7 +658,16 @@ def _load_valid_track_a_cache(
     indices_path = cache_dir / "selected_indices.npy"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if not isinstance(manifest, dict) or manifest.get("cache_key") != cache_key:
+        if not isinstance(manifest, dict):
+            return None
+        manifest_payload = {
+            key: manifest.get(key) for key in expected_payload
+        }
+        if manifest_payload != dict(expected_payload):
+            return None
+        if _canonical_sha256(manifest_payload) != cache_key:
+            return None
+        if manifest.get("cache_key") != cache_key:
             return None
         if checkpoint_sha256(features_path) != manifest.get("selected_features_sha256"):
             return None
@@ -645,6 +685,12 @@ def _load_valid_track_a_cache(
         return None
     indices = selected_indices.astype(np.int64, copy=False)
     if expected_indices is not None and not np.array_equal(indices, expected_indices):
+        return None
+    if manifest.get("selected_count") != len(indices):
+        return None
+    if manifest.get("selected_indices") != indices.tolist():
+        return None
+    if manifest.get("selected_features_shape") != list(selected_features.shape):
         return None
     return TrackAFeatureCache(
         selected_features=np.asarray(selected_features, dtype=np.float64),
@@ -674,6 +720,7 @@ def prepare_track_a_rfecv_cache(
     cache_dir = Path(run_root) / "cache" / f"track_a_rfecv_{cache_key}"
     cached = _load_valid_track_a_cache(
         cache_dir,
+        expected_payload=payload,
         cache_key=cache_key,
         expected_rows=artifacts.features.shape[0],
         expected_indices=expected,
@@ -1737,6 +1784,7 @@ class _TrackACorrectedFit:
     best_epoch: int
     validation_auroc: float
     validation_auprc: float
+    checkpoint_path: Path
     checkpoint_sha256: str
     balancing_audit: dict[str, object]
 
@@ -1955,6 +2003,7 @@ def _track_a_corrected_fit_no_scaler(
         best_epoch=best_epoch,
         validation_auroc=best_auroc,
         validation_auprc=best_auprc,
+        checkpoint_path=inference.path,
         checkpoint_sha256=str(inference.descriptor["sha256"]),
         balancing_audit=balanced.audit,
     )
@@ -2005,7 +2054,11 @@ def _track_a_prediction_frame(
     configuration_sha256: str,
     split_sha256: str,
     feature_sha256: str,
+    feature_indices_sha256: str,
+    feature_cache_key: str,
     checkpoint_sha: str,
+    author_commit: str,
+    code_revision: str,
 ) -> pd.DataFrame:
     analysis_ids = [f"author-sample-{index:04d}" for index in test_indices]
     rows = {
@@ -2030,6 +2083,11 @@ def _track_a_prediction_frame(
         "checkpoint_sha256": checkpoint_sha,
         "analysis_id": analysis_ids,
         "analysis_unit": "author_sample",
+        "mode": mode,
+        "author_commit": author_commit,
+        "feature_indices_sha256": feature_indices_sha256,
+        "feature_cache_key": feature_cache_key,
+        "code_revision": code_revision,
     }
     return pd.DataFrame(rows, columns=list(PREDICTION_COLUMNS) + list(_TRACK_A_COLUMNS))
 
@@ -2063,6 +2121,7 @@ def _track_a_metric_row(
     model_reinitialized: bool,
     checkpoint_sha: str,
     author_commit: str,
+    code_revision: str,
     feature_cache: TrackAFeatureCache,
     fold_hash: str,
     balancing_audit: Mapping[str, object],
@@ -2092,6 +2151,7 @@ def _track_a_metric_row(
         "track": "A",
         "analysis_id": f"{mode}:{frame['model_name'].iloc[0]}:fold-{int(frame['fold'].iloc[0])}",
         "analysis_unit": "author_sample",
+        "protocol": str(frame["protocol"].iloc[0]),
         "mode": mode,
         "model_name": str(frame["model_name"].iloc[0]),
         "fold": int(frame["fold"].iloc[0]),
@@ -2119,10 +2179,14 @@ def _track_a_metric_row(
         "fn": int(fn),
         "tp": int(tp),
         "checkpoint_sha256": checkpoint_sha,
+        "configuration_sha256": str(frame["configuration_sha256"].iloc[0]),
         "feature_sha256": feature_cache.selected_features_sha256,
         "feature_indices_sha256": feature_cache.selected_indices_sha256,
+        "feature_cache_key": feature_cache.cache_key,
+        "split_sha256": fold_hash,
         "fold_sha256": fold_hash,
         "author_commit": author_commit,
+        "code_revision": code_revision,
         "global_feature_selection_retained": True,
         "released_preprocessed_array_retained": True,
         "external_standard_scaler": False,
@@ -2130,70 +2194,181 @@ def _track_a_metric_row(
     }
 
 
+def _track_a_relative_artifact_path(path: Path, fold_dir: Path) -> str:
+    try:
+        relative = path.resolve().relative_to(fold_dir.resolve())
+    except ValueError as exc:
+        raise ValueError("Track A fold artifacts must remain inside their fold directory") from exc
+    return relative.as_posix()
+
+
+def _track_a_receipt_identity(
+    context: TrackAFoldContext,
+    fold_dir: Path,
+) -> dict[str, object]:
+    return {
+        "status": "complete",
+        "run_id": context.run_id,
+        "track": "A",
+        "mode": context.mode,
+        "protocol": context.protocol,
+        "fold": context.fold,
+        "model_name": context.model_name,
+        "author_commit": context.author_commit,
+        "feature_sha256": context.feature_sha256,
+        "feature_indices_sha256": context.feature_indices_sha256,
+        "feature_cache_key": context.feature_cache_key,
+        "configuration_sha256": context.configuration_sha256,
+        "split_sha256": context.split_sha256,
+        "code_revision": context.code_revision,
+        "threshold_source": context.threshold_source,
+        "predictions_path": "predictions.csv",
+        "metrics_path": "metrics.json",
+        "checkpoint_path": _track_a_relative_artifact_path(
+            context.checkpoint_path,
+            fold_dir,
+        ),
+        "checkpoint_sha256": context.checkpoint_sha256,
+    }
+
+
+def _require_track_a_prediction_identity(
+    predictions: pd.DataFrame,
+    context: TrackAFoldContext,
+) -> None:
+    expected = {
+        "run_id": context.run_id,
+        "track": "A",
+        "protocol": context.protocol,
+        "fold": context.fold,
+        "model_name": context.model_name,
+        "mode": context.mode,
+        "author_commit": context.author_commit,
+        "threshold_source": context.threshold_source,
+        "configuration_sha256": context.configuration_sha256,
+        "split_sha256": context.split_sha256,
+        "feature_sha256": context.feature_sha256,
+        "feature_indices_sha256": context.feature_indices_sha256,
+        "feature_cache_key": context.feature_cache_key,
+        "code_revision": context.code_revision,
+        "checkpoint_sha256": context.checkpoint_sha256,
+    }
+    if predictions.empty:
+        raise ValueError("authenticated fold predictions cannot be empty")
+    for field, value in expected.items():
+        if field not in predictions or not predictions[field].eq(value).all():
+            raise ValueError(
+                f"authenticated fold prediction identity mismatch for {field}"
+            )
+
+
+def _require_track_a_metric_identity(
+    metric: Mapping[str, object],
+    context: TrackAFoldContext,
+) -> None:
+    expected = {
+        "run_id": context.run_id,
+        "track": "A",
+        "protocol": context.protocol,
+        "mode": context.mode,
+        "fold": context.fold,
+        "model_name": context.model_name,
+        "author_commit": context.author_commit,
+        "feature_sha256": context.feature_sha256,
+        "feature_indices_sha256": context.feature_indices_sha256,
+        "feature_cache_key": context.feature_cache_key,
+        "configuration_sha256": context.configuration_sha256,
+        "split_sha256": context.split_sha256,
+        "code_revision": context.code_revision,
+        "threshold_source": context.threshold_source,
+        "checkpoint_sha256": context.checkpoint_sha256,
+    }
+    for field, value in expected.items():
+        if metric.get(field) != value:
+            raise ValueError(f"authenticated fold metric identity mismatch for {field}")
+
+
 def _write_track_a_fold_outputs(
     fold_dir: Path,
     predictions: pd.DataFrame,
     metric: dict[str, object],
     *,
-    feature_cache: TrackAFeatureCache,
-    author_commit: str,
-    configuration_sha256: str,
-    split_sha256: str,
-    code_revision: str,
-) -> None:
+    context: TrackAFoldContext,
+) -> Path:
     predictions_path = fold_dir / "predictions.csv"
     metrics_path = fold_dir / "metrics.json"
+    if not context.checkpoint_path.is_file():
+        raise ValueError("authenticated fold checkpoint is missing")
+    if checkpoint_sha256(context.checkpoint_path) != context.checkpoint_sha256:
+        raise ValueError("authenticated fold checkpoint hash mismatch")
+    _require_track_a_prediction_identity(predictions, context)
+    _require_track_a_metric_identity(metric, context)
     write_predictions(predictions, predictions_path)
     serializable_metric = {
         key: (None if isinstance(value, float) and not math.isfinite(value) else value)
         for key, value in metric.items()
     }
     _atomic_json_write(serializable_metric, metrics_path)
-    _atomic_json_write(
-        {
-            "status": "complete",
-            "mode": metric["mode"],
-            "model_name": metric["model_name"],
-            "fold": metric["fold"],
-            "feature_sha256": feature_cache.selected_features_sha256,
-            "feature_indices_sha256": feature_cache.selected_indices_sha256,
-            "fold_sha256": split_sha256,
-            "configuration_sha256": configuration_sha256,
-            "checkpoint_sha256": metric["checkpoint_sha256"],
-            "predictions_sha256": checkpoint_sha256(predictions_path),
-            "metrics_sha256": checkpoint_sha256(metrics_path),
-            "code_revision": code_revision,
-            "author_commit": author_commit,
-            "global_feature_selection_retained": True,
-            "released_preprocessed_array_retained": True,
-            "author_training_order": metric["author_training_order"],
-            "author_randomness_unseeded": True,
-            "reconstruction_seed": metric["reconstruction_seed"],
-        },
-        fold_dir / "receipt.json",
-    )
+    receipt = {
+        **_track_a_receipt_identity(context, fold_dir),
+        "predictions_sha256": checkpoint_sha256(predictions_path),
+        "metrics_sha256": checkpoint_sha256(metrics_path),
+        "global_feature_selection_retained": True,
+        "released_preprocessed_array_retained": True,
+        "author_training_order": metric["author_training_order"],
+        "author_randomness_unseeded": True,
+        "reconstruction_seed": metric["reconstruction_seed"],
+    }
+    receipt_path = fold_dir / "receipt.json"
+    _atomic_json_write(receipt, receipt_path)
+    return receipt_path
 
 
 def _load_completed_track_a_fold(
     fold_dir: Path,
+    *,
+    expected: TrackAFoldContext,
 ) -> tuple[pd.DataFrame, dict[str, object]] | None:
     receipt_path = fold_dir / "receipt.json"
     predictions_path = fold_dir / "predictions.csv"
     metrics_path = fold_dir / "metrics.json"
-    if not (receipt_path.is_file() and predictions_path.is_file() and metrics_path.is_file()):
+    present = tuple(
+        path.is_file() for path in (receipt_path, predictions_path, metrics_path)
+    )
+    if not any(present):
         return None
+    if not all(present):
+        raise ValueError("authenticated fold output set is incomplete")
     try:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if not isinstance(receipt, dict):
+            raise ValueError("authenticated fold receipt must be a JSON object")
+        expected_receipt = _track_a_receipt_identity(expected, fold_dir)
+        for field, value in expected_receipt.items():
+            if receipt.get(field) != value:
+                raise ValueError(
+                    f"authenticated fold receipt identity mismatch for {field}"
+                )
         if checkpoint_sha256(predictions_path) != receipt.get("predictions_sha256"):
-            return None
+            raise ValueError("authenticated fold prediction hash mismatch")
         if checkpoint_sha256(metrics_path) != receipt.get("metrics_sha256"):
-            return None
+            raise ValueError("authenticated fold metric hash mismatch")
+        if not expected.checkpoint_path.is_file():
+            raise ValueError("authenticated fold checkpoint is missing")
+        if checkpoint_sha256(expected.checkpoint_path) != expected.checkpoint_sha256:
+            raise ValueError("authenticated fold checkpoint hash mismatch")
         metric = json.loads(metrics_path.read_text(encoding="utf-8"))
         predictions = validate_prediction_frame(pd.read_csv(predictions_path))
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
-    if receipt.get("status") != "complete":
-        return None
+        if not isinstance(metric, dict):
+            raise ValueError("authenticated fold metric must be a JSON object")
+        _require_track_a_prediction_identity(predictions, expected)
+        _require_track_a_metric_identity(metric, expected)
+    except ValueError as exc:
+        if str(exc).startswith("authenticated fold"):
+            raise
+        raise ValueError("authenticated fold output identity is invalid") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("authenticated fold output cannot be read") from exc
     return predictions, metric
 
 
@@ -2210,6 +2385,152 @@ def _validated_track_a_fold_batch(
     if selected[0] < 0 or selected[-1] >= fold_count:
         raise ValueError(f"fold_batch values must be within 0..{fold_count - 1}")
     return selected
+
+
+def _track_a_author_split_sha256(
+    artifacts: AuthorTrackAArtifacts,
+    fold: int,
+) -> str:
+    return _canonical_sha256(
+        {
+            "fold": fold,
+            "train_hash": artifacts.fold_hashes.get(
+                f"Train-Test Split/coswaradataset/train/{fold}.csv",
+                _canonical_sha256(artifacts.train_folds[fold].tolist()),
+            ),
+            "test_hash": artifacts.fold_hashes.get(
+                f"Train-Test Split/coswaradataset/test/{fold}.csv",
+                _canonical_sha256(artifacts.test_folds[fold].tolist()),
+            ),
+        }
+    )
+
+
+def _resolve_track_a_fold_inference(fold_dir: Path) -> ResolvedCheckpoint:
+    try:
+        return _resolve_checkpoint_manifest(
+            fold_dir / "checkpoints",
+            role="best_inference",
+            map_location="cpu",
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise ValueError("authenticated fold checkpoint is missing or invalid") from exc
+
+
+def _track_a_author_fold_context(
+    *,
+    run_dir: Path,
+    run_id: str,
+    fold: int,
+    model_name: str,
+    artifacts: AuthorTrackAArtifacts,
+    feature_cache: TrackAFeatureCache,
+    configuration_sha256: str,
+    code_revision: str,
+) -> TrackAFoldContext:
+    fold_dir = (
+        run_dir
+        / "track_a"
+        / "author_behaviour_audit"
+        / model_name
+        / f"fold_{fold:02d}"
+    )
+    inference = _resolve_track_a_fold_inference(fold_dir)
+    return TrackAFoldContext(
+        run_id=run_id,
+        mode="author_behaviour_audit",
+        fold=fold,
+        model_name=model_name,
+        author_commit=artifacts.author_commit,
+        feature_sha256=feature_cache.selected_features_sha256,
+        feature_indices_sha256=feature_cache.selected_indices_sha256,
+        feature_cache_key=feature_cache.cache_key,
+        configuration_sha256=configuration_sha256,
+        split_sha256=_track_a_author_split_sha256(artifacts, fold),
+        code_revision=code_revision,
+        threshold_source="test_balanced_accuracy_author_audit",
+        checkpoint_path=inference.path,
+        checkpoint_sha256=str(inference.descriptor["sha256"]),
+    )
+
+
+def _track_a_receipt_state_binding(
+    *,
+    run_dir: Path,
+    fold_dir: Path,
+    context: TrackAFoldContext,
+) -> dict[str, object]:
+    receipt_path = fold_dir / "receipt.json"
+    if not receipt_path.is_file():
+        raise ValueError("contiguous authenticated receipt chain is incomplete")
+    receipt_identity = _track_a_receipt_identity(context, fold_dir)
+    return {
+        "completed_receipt_path": _track_a_relative_artifact_path(
+            receipt_path,
+            run_dir,
+        ),
+        "completed_receipt_sha256": checkpoint_sha256(receipt_path),
+        "completed_receipt_identity": receipt_identity,
+        "completed_receipt_identity_sha256": _canonical_sha256(receipt_identity),
+    }
+
+
+def _validate_track_a_author_receipt_chain(
+    *,
+    run_dir: Path,
+    run_id: str,
+    next_fold: int,
+    model_name: str,
+    artifacts: AuthorTrackAArtifacts,
+    feature_cache: TrackAFeatureCache,
+    configuration_sha256: str,
+    code_revision: str,
+    state: Mapping[str, object],
+) -> tuple[dict[int, tuple[pd.DataFrame, dict[str, object]]], dict[str, object]]:
+    completed: dict[int, tuple[pd.DataFrame, dict[str, object]]] = {}
+    latest_binding: dict[str, object] = {}
+    for fold in range(next_fold):
+        fold_dir = (
+            run_dir
+            / "track_a"
+            / "author_behaviour_audit"
+            / model_name
+            / f"fold_{fold:02d}"
+        )
+        try:
+            context = _track_a_author_fold_context(
+                run_dir=run_dir,
+                run_id=run_id,
+                fold=fold,
+                model_name=model_name,
+                artifacts=artifacts,
+                feature_cache=feature_cache,
+                configuration_sha256=configuration_sha256,
+                code_revision=code_revision,
+            )
+            loaded = _load_completed_track_a_fold(fold_dir, expected=context)
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            raise ValueError(
+                "contiguous authenticated receipt chain is missing or invalid"
+            ) from exc
+        if loaded is None:
+            raise ValueError(
+                "contiguous authenticated receipt chain is missing or invalid"
+            )
+        completed[fold] = loaded
+        latest_binding = _track_a_receipt_state_binding(
+            run_dir=run_dir,
+            fold_dir=fold_dir,
+            context=context,
+        )
+    if next_fold > 0:
+        for field, value in latest_binding.items():
+            if state.get(field) != value:
+                raise ValueError(
+                    "author between-fold state is not bound to the immediately "
+                    f"preceding receipt: {field}"
+                )
+    return completed, latest_binding
 
 
 def run_track_a(
@@ -2256,12 +2577,18 @@ def run_track_a(
 
     if artifacts is None:
         author_repo = config.get("author_repo")
-        expected_commit = config.get("author_commit", TRACK_A_AUTHOR_COMMIT)
+        expected_commit = config.get("author_commit")
         if not isinstance(author_repo, str) or not author_repo:
             raise ValueError("config author_repo must be a nonempty path")
-        if not isinstance(expected_commit, str) or not expected_commit:
-            raise ValueError("config author_commit must be a nonempty string")
-        artifacts = load_track_a_author_artifacts(author_repo, expected_commit)
+        if expected_commit != TRACK_A_AUTHOR_COMMIT:
+            raise ValueError(
+                "config author_commit must equal the pinned author commit "
+                f"{TRACK_A_AUTHOR_COMMIT}"
+            )
+        artifacts = load_track_a_author_artifacts(
+            author_repo,
+            TRACK_A_AUTHOR_COMMIT,
+        )
     folds = _validated_track_a_fold_batch(
         (0,) if smoke else fold_batch, len(artifacts.test_folds)
     )
@@ -2346,6 +2673,7 @@ def run_track_a(
                 next_fold = 0
                 resume_epoch = 0
                 phase = "between_folds"
+                state: dict[str, object] = {}
                 if resume and _manifest_path(state_dir, "latest_recovery").is_file():
                     recovered = _resolve_checkpoint_manifest(
                         state_dir, role="latest_recovery", map_location="cpu"
@@ -2365,17 +2693,31 @@ def run_track_a(
                         "author_behaviour_audit fold batch lacks the exact valid preceding state/receipt: "
                         f"state points to fold {next_fold}, batch is {folds[0]}..{folds[-1]}"
                     )
+                if phase not in {"between_folds", "training", "trained"}:
+                    raise ValueError("author Track A resume phase is invalid")
+                if phase == "between_folds" and resume_epoch != 0:
+                    raise ValueError("author between-fold state must have completed_epoch=0")
+                if phase != "between_folds" and state.get("fold_batch") != list(folds):
+                    raise ValueError(
+                        "author in-fold resume must use the exact interrupted fold batch"
+                    )
+                completed_prior, preceding_receipt_binding = (
+                    _validate_track_a_author_receipt_chain(
+                        run_dir=run_dir,
+                        run_id=run_id,
+                        next_fold=next_fold,
+                        model_name=model_name,
+                        artifacts=artifacts,
+                        feature_cache=feature_cache,
+                        configuration_sha256=configuration_sha,
+                        code_revision=code_revision,
+                        state=state,
+                    )
+                )
 
                 for fold in folds:
                     if fold < next_fold:
-                        completed = _load_completed_track_a_fold(
-                            run_dir / "track_a" / mode / model_name / f"fold_{fold:02d}"
-                        )
-                        if completed is None:
-                            raise ValueError(
-                                "author Track A state is ahead of a missing or invalid fold receipt"
-                            )
-                        predictions, metric = completed
+                        predictions, metric = completed_prior[fold]
                         all_predictions.append(predictions)
                         all_metrics.append(metric)
                         completed_units += 1
@@ -2417,9 +2759,11 @@ def run_track_a(
                                 "next_fold": fold,
                                 "completed_epoch": epoch,
                                 "phase": phase_after,
+                                "fold_batch": list(folds),
                                 "rng_state": _rng_state(),
                                 "fold_seed": fold_seed,
                                 "balancing_audit": balanced.audit,
+                                **preceding_receipt_binding,
                             },
                             state_dir,
                             role="latest_recovery",
@@ -2429,9 +2773,6 @@ def run_track_a(
                             raise PlannedInterruption(
                                 f"planned Track A interruption at {mode}/{model_name}/{fold}/{epoch}"
                             )
-                    trained_state = _resolve_checkpoint_manifest(
-                        state_dir, role="latest_recovery", map_location="cpu"
-                    )
                     test_indices = artifacts.test_folds[fold]
                     probability_n = _predict_track_a_outer_test(
                         model,
@@ -2446,18 +2787,26 @@ def run_track_a(
                     public_threshold = author_threshold_to_covid_threshold(
                         float(threshold_audit["author_threshold"])
                     )
-                    split_sha = _canonical_sha256(
+                    split_sha = _track_a_author_split_sha256(artifacts, fold)
+                    fold_dir = (
+                        run_dir
+                        / "track_a"
+                        / mode
+                        / model_name
+                        / f"fold_{fold:02d}"
+                    )
+                    fold_inference = _publish_checkpoint_generation(
                         {
+                            "format_version": 1,
+                            "checkpoint_role": "best_inference",
+                            "track_a_configuration_sha256": configuration_sha,
+                            "model_state": model.state_dict(),
                             "fold": fold,
-                            "train_hash": artifacts.fold_hashes.get(
-                                f"Train-Test Split/coswaradataset/train/{fold}.csv",
-                                _canonical_sha256(train_indices.tolist()),
-                            ),
-                            "test_hash": artifacts.fold_hashes.get(
-                                f"Train-Test Split/coswaradataset/test/{fold}.csv",
-                                _canonical_sha256(test_indices.tolist()),
-                            ),
-                        }
+                            "split_sha256": split_sha,
+                        },
+                        fold_dir / "checkpoints",
+                        role="best_inference",
+                        epoch=int(published["epochs"]),
                     )
                     predictions = _track_a_prediction_frame(
                         run_id=run_id,
@@ -2473,7 +2822,11 @@ def run_track_a(
                         configuration_sha256=configuration_sha,
                         split_sha256=split_sha,
                         feature_sha256=feature_cache.selected_features_sha256,
-                        checkpoint_sha=str(trained_state.descriptor["sha256"]),
+                        feature_indices_sha256=feature_cache.selected_indices_sha256,
+                        feature_cache_key=feature_cache.cache_key,
+                        checkpoint_sha=str(fold_inference.descriptor["sha256"]),
+                        author_commit=artifacts.author_commit,
+                        code_revision=code_revision,
                     )
                     metric = _track_a_metric_row(
                         frame=predictions,
@@ -2488,23 +2841,42 @@ def run_track_a(
                         validation_auprc=None,
                         reconstruction_seed=reconstruction_seed,
                         model_reinitialized=False,
-                        checkpoint_sha=str(trained_state.descriptor["sha256"]),
+                        checkpoint_sha=str(fold_inference.descriptor["sha256"]),
                         author_commit=artifacts.author_commit,
+                        code_revision=code_revision,
                         feature_cache=feature_cache,
                         fold_hash=split_sha,
                         balancing_audit=balanced.audit,
                     )
-                    fold_dir = run_dir / "track_a" / mode / model_name / f"fold_{fold:02d}"
-                    _write_track_a_fold_outputs(
-                        fold_dir,
-                        predictions,
-                        metric,
-                        feature_cache=feature_cache,
+                    completed_context = TrackAFoldContext(
+                        run_id=run_id,
+                        mode=mode,
+                        fold=fold,
+                        model_name=model_name,
                         author_commit=artifacts.author_commit,
+                        feature_sha256=feature_cache.selected_features_sha256,
+                        feature_indices_sha256=feature_cache.selected_indices_sha256,
+                        feature_cache_key=feature_cache.cache_key,
                         configuration_sha256=configuration_sha,
                         split_sha256=split_sha,
                         code_revision=code_revision,
+                        threshold_source="test_balanced_accuracy_author_audit",
+                        checkpoint_path=fold_inference.path,
+                        checkpoint_sha256=str(fold_inference.descriptor["sha256"]),
                     )
+                    receipt_path = _write_track_a_fold_outputs(
+                        fold_dir,
+                        predictions,
+                        metric,
+                        context=completed_context,
+                    )
+                    completed_receipt_binding = _track_a_receipt_state_binding(
+                        run_dir=run_dir,
+                        fold_dir=fold_dir,
+                        context=completed_context,
+                    )
+                    if receipt_path != fold_dir / "receipt.json":
+                        raise RuntimeError("Track A receipt path is not deterministic")
                     _publish_checkpoint_generation(
                         {
                             "format_version": 1,
@@ -2515,8 +2887,9 @@ def run_track_a(
                             "next_fold": fold + 1,
                             "completed_epoch": 0,
                             "phase": "between_folds",
+                            "fold_batch": list(folds),
                             "rng_state": _rng_state(),
-                            "completed_receipt": str(fold_dir / "receipt.json"),
+                            **completed_receipt_binding,
                         },
                         state_dir,
                         role="latest_recovery",
@@ -2525,19 +2898,14 @@ def run_track_a(
                     next_fold = fold + 1
                     resume_epoch = 0
                     phase = "between_folds"
+                    preceding_receipt_binding = completed_receipt_binding
+                    completed_prior[fold] = (predictions, metric)
                     all_predictions.append(predictions)
                     all_metrics.append(metric)
                     completed_units += 1
             else:
                 for fold in folds:
                     fold_dir = run_dir / "track_a" / mode / model_name / f"fold_{fold:02d}"
-                    completed = _load_completed_track_a_fold(fold_dir) if resume else None
-                    if completed is not None:
-                        predictions, metric = completed
-                        all_predictions.append(predictions)
-                        all_metrics.append(metric)
-                        completed_units += 1
-                        continue
                     outer_train = artifacts.train_folds[fold]
                     inner_train, inner_validation = train_test_split(
                         outer_train,
@@ -2557,6 +2925,48 @@ def run_track_a(
                             ),
                         }
                     )
+                    completed = None
+                    completion_files = tuple(
+                        fold_dir / name
+                        for name in ("receipt.json", "predictions.csv", "metrics.json")
+                    )
+                    if resume and any(path.exists() for path in completion_files):
+                        try:
+                            inference = _resolve_checkpoint_manifest(
+                                fold_dir / "checkpoints",
+                                role="best_inference",
+                                map_location="cpu",
+                            )
+                        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+                            raise ValueError(
+                                "authenticated fold checkpoint is missing or invalid"
+                            ) from exc
+                        completed_context = TrackAFoldContext(
+                            run_id=run_id,
+                            mode=mode,
+                            fold=fold,
+                            model_name=model_name,
+                            author_commit=artifacts.author_commit,
+                            feature_sha256=feature_cache.selected_features_sha256,
+                            feature_indices_sha256=feature_cache.selected_indices_sha256,
+                            feature_cache_key=feature_cache.cache_key,
+                            configuration_sha256=configuration_sha,
+                            split_sha256=split_sha,
+                            code_revision=code_revision,
+                            threshold_source="inner_validation_balanced_accuracy",
+                            checkpoint_path=inference.path,
+                            checkpoint_sha256=str(inference.descriptor["sha256"]),
+                        )
+                        completed = _load_completed_track_a_fold(
+                            fold_dir,
+                            expected=completed_context,
+                        )
+                    if completed is not None:
+                        predictions, metric = completed
+                        all_predictions.append(predictions)
+                        all_metrics.append(metric)
+                        completed_units += 1
+                        continue
                     requested_interrupt = (
                         interrupt_after[3]
                         if interrupt_after is not None
@@ -2605,7 +3015,11 @@ def run_track_a(
                         configuration_sha256=configuration_sha,
                         split_sha256=split_sha,
                         feature_sha256=feature_cache.selected_features_sha256,
+                        feature_indices_sha256=feature_cache.selected_indices_sha256,
+                        feature_cache_key=feature_cache.cache_key,
                         checkpoint_sha=fitted.checkpoint_sha256,
+                        author_commit=artifacts.author_commit,
+                        code_revision=code_revision,
                     )
                     metric = _track_a_metric_row(
                         frame=predictions,
@@ -2620,21 +3034,34 @@ def run_track_a(
                         model_reinitialized=True,
                         checkpoint_sha=fitted.checkpoint_sha256,
                         author_commit=artifacts.author_commit,
+                        code_revision=code_revision,
                         feature_cache=feature_cache,
                         fold_hash=split_sha,
                         balancing_audit=fitted.balancing_audit,
                         inner_split_seed=reconstruction_seed + fold,
                         inner_validation_fraction=0.125,
                     )
+                    completed_context = TrackAFoldContext(
+                        run_id=run_id,
+                        mode=mode,
+                        fold=fold,
+                        model_name=model_name,
+                        author_commit=artifacts.author_commit,
+                        feature_sha256=feature_cache.selected_features_sha256,
+                        feature_indices_sha256=feature_cache.selected_indices_sha256,
+                        feature_cache_key=feature_cache.cache_key,
+                        configuration_sha256=configuration_sha,
+                        split_sha256=split_sha,
+                        code_revision=code_revision,
+                        threshold_source="inner_validation_balanced_accuracy",
+                        checkpoint_path=fitted.checkpoint_path,
+                        checkpoint_sha256=fitted.checkpoint_sha256,
+                    )
                     _write_track_a_fold_outputs(
                         fold_dir,
                         predictions,
                         metric,
-                        feature_cache=feature_cache,
-                        author_commit=artifacts.author_commit,
-                        configuration_sha256=configuration_sha,
-                        split_sha256=split_sha,
-                        code_revision=code_revision,
+                        context=completed_context,
                     )
                     all_predictions.append(predictions)
                     all_metrics.append(metric)

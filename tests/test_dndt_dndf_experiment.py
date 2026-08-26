@@ -4,6 +4,7 @@ import hashlib
 import inspect
 import json
 import math
+import shutil
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -855,8 +856,17 @@ def _prediction_frame(track: str = "B") -> pd.DataFrame:
     }
     columns = list(PREDICTION_COLUMNS)
     if track == "A":
-        row.update({"analysis_id": "sample-1", "analysis_unit": "author_sample"})
-        columns.extend(["analysis_id", "analysis_unit"])
+        track_a_provenance = {
+            "analysis_id": "sample-1",
+            "analysis_unit": "author_sample",
+            "mode": "corrected_reference",
+            "author_commit": "e" * 40,
+            "feature_indices_sha256": "f" * 64,
+            "feature_cache_key": "0" * 64,
+            "code_revision": "task4-test-revision",
+        }
+        row.update(track_a_provenance)
+        columns.extend(track_a_provenance)
     return pd.DataFrame([row], columns=columns)
 
 
@@ -970,6 +980,64 @@ def _tiny_track_a_config(tmp_path: Path) -> dict[str, object]:
     }
 
 
+@pytest.fixture(scope="module")
+def completed_corrected_track_a_template(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[Path, AuthorTrackAArtifacts, TrackAFeatureCache, dict[str, object]]:
+    root = tmp_path_factory.mktemp("track-a-corrected-template")
+    artifacts = _tiny_track_a_artifacts()
+    cache = _tiny_track_a_cache(root)
+    config = _tiny_track_a_config(root)
+    run_track_a(
+        config,
+        run_id="resume",
+        artifacts=artifacts,
+        feature_cache=cache,
+        fold_batch=(0,),
+        modes=("corrected_reference",),
+        model_names=("dndt",),
+        code_revision="task4-provenance-test",
+        device="cpu",
+    )
+    return root, artifacts, cache, config
+
+
+def _copied_corrected_track_a_case(
+    tmp_path: Path,
+    template: tuple[
+        Path,
+        AuthorTrackAArtifacts,
+        TrackAFeatureCache,
+        dict[str, object],
+    ],
+) -> tuple[Path, AuthorTrackAArtifacts, TrackAFeatureCache, dict[str, object]]:
+    template_root, artifacts, cache, _ = template
+    destination = tmp_path / "runs" / "resume"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(template_root / "runs" / "resume", destination)
+    config = _tiny_track_a_config(tmp_path)
+    return destination, artifacts, cache, config
+
+
+def _resume_copied_corrected_track_a(
+    config: dict[str, object],
+    artifacts: AuthorTrackAArtifacts,
+    cache: TrackAFeatureCache,
+) -> dict[str, object]:
+    return run_track_a(
+        config,
+        run_id="resume",
+        resume=True,
+        artifacts=artifacts,
+        feature_cache=cache,
+        fold_batch=(0,),
+        modes=("corrected_reference",),
+        model_names=("dndt",),
+        code_revision="task4-provenance-test",
+        device="cpu",
+    )
+
+
 def test_fixed_order_batches_repeat_stable_rows_and_never_shuffle() -> None:
     first = fixed_order_batch_indices(11, 4)
     second = fixed_order_batch_indices(11, 4)
@@ -1057,6 +1125,78 @@ def test_rfecv_cache_is_global_hashed_and_recomputed_after_corruption(
     assert not list(first.manifest_path.parent.glob("*.tmp"))
 
 
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "source_hashes",
+        "sklearn_version",
+        "algorithm_settings",
+        "cache_key",
+        "selected_features_bytes",
+        "selected_indices_bytes",
+    ),
+)
+def test_rfecv_cache_rejects_every_provenance_or_byte_corruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    artifacts = _tiny_track_a_artifacts()
+    calls: list[tuple[int, int]] = []
+
+    class FakeRfecv:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def fit(self, features: np.ndarray, labels: np.ndarray) -> FakeRfecv:
+            calls.append(features.shape)
+            self.support_ = np.array([True, False, True, False, True, False])
+            return self
+
+    import covid_rars.dndt_dndf_experiment as experiment
+
+    monkeypatch.setattr(experiment, "RFECV", FakeRfecv)
+    cached = prepare_track_a_rfecv_cache(
+        artifacts,
+        tmp_path,
+        expected_indices=np.array([0, 2, 4]),
+    )
+    manifest = json.loads(cached.manifest_path.read_text(encoding="utf-8"))
+    if corruption == "source_hashes":
+        manifest["source_hashes"]["features"] = _sha("wrong-source")
+    elif corruption == "sklearn_version":
+        manifest["sklearn_version"] = "0.0-corrupt"
+    elif corruption == "algorithm_settings":
+        manifest["algorithm"]["rfecv"]["step"] = 2
+    elif corruption == "cache_key":
+        manifest["cache_key"] = _sha("wrong-key")
+    elif corruption == "selected_features_bytes":
+        (cached.manifest_path.parent / "selected_features.npy").write_bytes(b"corrupt")
+    elif corruption == "selected_indices_bytes":
+        (cached.manifest_path.parent / "selected_indices.npy").write_bytes(b"corrupt")
+    else:  # pragma: no cover - parameter list is exhaustive
+        raise AssertionError(corruption)
+    if corruption not in {"selected_features_bytes", "selected_indices_bytes"}:
+        cached.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    repaired = prepare_track_a_rfecv_cache(
+        artifacts,
+        tmp_path,
+        expected_indices=np.array([0, 2, 4]),
+    )
+
+    assert calls == [(48, 6), (48, 6)]
+    np.testing.assert_array_equal(
+        repaired.selected_features,
+        artifacts.features[:, [0, 2, 4]],
+    )
+    repaired_manifest = json.loads(
+        repaired.manifest_path.read_text(encoding="utf-8")
+    )
+    assert repaired_manifest["source_hashes"] == artifacts.source_hashes
+    assert repaired_manifest["cache_key"] == repaired.cache_key
+
+
 def test_rfecv_expected_index_assertion_rejects_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1080,6 +1220,34 @@ def test_rfecv_expected_index_assertion_rejects_drift(
             expected_indices=np.array([0, 2, 4]),
         )
     assert len(EXPECTED_TRACK_A_SELECTED_INDICES) == 33
+
+
+@pytest.mark.parametrize("configured_commit", (None, "f" * 40))
+def test_track_a_production_loader_requires_immutable_author_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured_commit: str | None,
+) -> None:
+    import covid_rars.dndt_dndf_experiment as experiment
+
+    config = _tiny_track_a_config(tmp_path)
+    config["author_repo"] = str(tmp_path / "author")
+    if configured_commit is None:
+        config.pop("author_commit")
+    else:
+        config["author_commit"] = configured_commit
+
+    def unexpected_loader(*_: object, **__: object) -> AuthorTrackAArtifacts:
+        raise AssertionError("artifact loader must not run for an invalid production pin")
+
+    monkeypatch.setattr(experiment, "load_track_a_author_artifacts", unexpected_loader)
+    with pytest.raises(ValueError, match="pinned author commit"):
+        run_track_a(
+            config,
+            run_id="invalid-author-pin",
+            code_revision="task4-pin-test",
+            device="cpu",
+        )
 
 
 def test_track_a_modes_record_identity_threshold_and_training_order_contracts(
@@ -1182,8 +1350,320 @@ def test_author_fold_batch_resume_matches_uninterrupted_and_writes_atomic_receip
     prediction_path.write_text(
         prediction_path.read_text(encoding="utf-8") + "\n", encoding="utf-8"
     )
-    with pytest.raises(ValueError, match="missing or invalid fold receipt"):
+    with pytest.raises(ValueError, match="authenticated receipt chain.*invalid"):
         run_track_a(config, run_id="resumed", resume=True, **common)
+
+
+def test_track_a_predictions_carry_complete_fold_provenance(tmp_path: Path) -> None:
+    artifacts = _tiny_track_a_artifacts()
+    cache = _tiny_track_a_cache(tmp_path)
+    result = run_track_a(
+        _tiny_track_a_config(tmp_path),
+        run_id="prediction-provenance",
+        artifacts=artifacts,
+        feature_cache=cache,
+        fold_batch=(0,),
+        modes=("corrected_reference",),
+        model_names=("dndt",),
+        code_revision="task4-prediction-provenance-test",
+        device="cpu",
+    )
+
+    predictions = pd.DataFrame(result["predictions"])
+    expected = {
+        "mode": "corrected_reference",
+        "author_commit": artifacts.author_commit,
+        "feature_indices_sha256": cache.selected_indices_sha256,
+        "feature_cache_key": cache.cache_key,
+        "code_revision": "task4-prediction-provenance-test",
+    }
+    for field, value in expected.items():
+        assert field in predictions
+        assert predictions[field].eq(value).all()
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "status",
+        "run_id",
+        "track",
+        "mode",
+        "protocol",
+        "fold",
+        "model_name",
+        "author_commit",
+        "feature_sha256",
+        "feature_indices_sha256",
+        "feature_cache_key",
+        "configuration_sha256",
+        "split_sha256",
+        "code_revision",
+        "threshold_source",
+        "predictions_path",
+        "metrics_path",
+        "checkpoint_path",
+        "checkpoint_sha256",
+        "predictions_sha256",
+        "metrics_sha256",
+    ),
+)
+def test_completed_fold_resume_rejects_each_tampered_receipt_provenance_field(
+    tmp_path: Path,
+    completed_corrected_track_a_template: tuple[
+        Path,
+        AuthorTrackAArtifacts,
+        TrackAFeatureCache,
+        dict[str, object],
+    ],
+    field: str,
+) -> None:
+    run_dir, artifacts, cache, config = _copied_corrected_track_a_case(
+        tmp_path,
+        completed_corrected_track_a_template,
+    )
+    receipt_path = (
+        run_dir
+        / "track_a"
+        / "corrected_reference"
+        / "dndt"
+        / "fold_00"
+        / "receipt.json"
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt[field] = 999 if field == "fold" else "tampered"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="authenticated fold"):
+        _resume_copied_corrected_track_a(config, artifacts, cache)
+
+
+@pytest.mark.parametrize(
+    ("target", "field"),
+    (
+        *(('prediction', field) for field in (
+            "run_id",
+            "track",
+            "mode",
+            "protocol",
+            "fold",
+            "model_name",
+            "author_commit",
+            "threshold_source",
+            "configuration_sha256",
+            "split_sha256",
+            "feature_sha256",
+            "feature_indices_sha256",
+            "feature_cache_key",
+            "code_revision",
+            "checkpoint_sha256",
+        )),
+        *(('metric', field) for field in (
+            "run_id",
+            "track",
+            "protocol",
+            "mode",
+            "fold",
+            "model_name",
+            "author_commit",
+            "feature_sha256",
+            "feature_indices_sha256",
+            "feature_cache_key",
+            "configuration_sha256",
+            "split_sha256",
+            "code_revision",
+            "threshold_source",
+            "checkpoint_sha256",
+        )),
+    ),
+)
+def test_completed_fold_resume_rejects_tampered_output_identity_even_with_new_hash(
+    tmp_path: Path,
+    completed_corrected_track_a_template: tuple[
+        Path,
+        AuthorTrackAArtifacts,
+        TrackAFeatureCache,
+        dict[str, object],
+    ],
+    target: str,
+    field: str,
+) -> None:
+    run_dir, artifacts, cache, config = _copied_corrected_track_a_case(
+        tmp_path,
+        completed_corrected_track_a_template,
+    )
+    fold_dir = (
+        run_dir / "track_a" / "corrected_reference" / "dndt" / "fold_00"
+    )
+    receipt_path = fold_dir / "receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if target == "prediction":
+        output_path = fold_dir / "predictions.csv"
+        output = pd.read_csv(output_path)
+        output[field] = 999 if field == "fold" else "tampered"
+        output.to_csv(output_path, index=False)
+        receipt["predictions_sha256"] = checkpoint_sha256(output_path)
+    else:
+        output_path = fold_dir / "metrics.json"
+        output = json.loads(output_path.read_text(encoding="utf-8"))
+        output[field] = 999 if field == "fold" else "tampered"
+        output_path.write_text(json.dumps(output), encoding="utf-8")
+        receipt["metrics_sha256"] = checkpoint_sha256(output_path)
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="authenticated fold"):
+        _resume_copied_corrected_track_a(config, artifacts, cache)
+
+
+@pytest.mark.parametrize("checkpoint_change", ("missing", "tampered"))
+def test_completed_fold_resume_rejects_missing_or_tampered_checkpoint_bytes(
+    tmp_path: Path,
+    completed_corrected_track_a_template: tuple[
+        Path,
+        AuthorTrackAArtifacts,
+        TrackAFeatureCache,
+        dict[str, object],
+    ],
+    checkpoint_change: str,
+) -> None:
+    run_dir, artifacts, cache, config = _copied_corrected_track_a_case(
+        tmp_path,
+        completed_corrected_track_a_template,
+    )
+    fold_dir = (
+        run_dir / "track_a" / "corrected_reference" / "dndt" / "fold_00"
+    )
+    receipt = json.loads((fold_dir / "receipt.json").read_text(encoding="utf-8"))
+    assert "checkpoint_path" in receipt
+    checkpoint_path = fold_dir / str(receipt["checkpoint_path"])
+    if checkpoint_change == "missing":
+        checkpoint_path.unlink()
+    else:
+        checkpoint_path.write_bytes(checkpoint_path.read_bytes() + b"tampered")
+
+    with pytest.raises(ValueError, match="checkpoint"):
+        _resume_copied_corrected_track_a(config, artifacts, cache)
+
+
+@pytest.mark.parametrize(
+    "change",
+    ("delete_fold_0", "tamper_fold_0", "delete_fold_1", "tamper_fold_1"),
+)
+def test_author_later_batch_requires_contiguous_authenticated_receipt_chain(
+    tmp_path: Path,
+    change: str,
+) -> None:
+    artifacts = _tiny_track_a_artifacts()
+    cache = _tiny_track_a_cache(tmp_path)
+    config = _tiny_track_a_config(tmp_path)
+    common = dict(
+        artifacts=artifacts,
+        feature_cache=cache,
+        modes=("author_behaviour_audit",),
+        model_names=("dndt",),
+        code_revision="task4-chain-test",
+        device="cpu",
+    )
+    run_track_a(
+        config,
+        run_id="chain",
+        fold_batch=(0, 1),
+        **common,
+    )
+    fold = 0 if change.endswith("_0") else 1
+    receipt_path = (
+        tmp_path
+        / "runs"
+        / "chain"
+        / "track_a"
+        / "author_behaviour_audit"
+        / "dndt"
+        / f"fold_{fold:02d}"
+        / "receipt.json"
+    )
+    if change.startswith("delete"):
+        receipt_path.unlink()
+    else:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["model_name"] = "tampered"
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="contiguous authenticated receipt chain"):
+        run_track_a(
+            config,
+            run_id="chain",
+            resume=True,
+            fold_batch=(2,),
+            **common,
+        )
+
+
+@pytest.mark.parametrize(
+    "binding_field",
+    (
+        "completed_receipt_path",
+        "completed_receipt_sha256",
+        "completed_receipt_identity",
+        "completed_receipt_identity_sha256",
+    ),
+)
+def test_author_between_fold_state_is_bound_to_immediately_preceding_receipt(
+    tmp_path: Path,
+    binding_field: str,
+) -> None:
+    artifacts = _tiny_track_a_artifacts()
+    cache = _tiny_track_a_cache(tmp_path)
+    config = _tiny_track_a_config(tmp_path)
+    common = dict(
+        artifacts=artifacts,
+        feature_cache=cache,
+        modes=("author_behaviour_audit",),
+        model_names=("dndt",),
+        code_revision="task4-state-binding-test",
+        device="cpu",
+    )
+    run_track_a(
+        config,
+        run_id="state-binding",
+        fold_batch=(0, 1),
+        **common,
+    )
+    state_dir = (
+        tmp_path
+        / "runs"
+        / "state-binding"
+        / "track_a"
+        / "author_behaviour_audit"
+        / "dndt"
+        / "state"
+    )
+    resolved = _resolve_checkpoint_manifest(
+        state_dir,
+        role="latest_recovery",
+        map_location="cpu",
+    )
+    state = dict(resolved.payload)
+    assert "completed_receipt_identity" in state
+    state[binding_field] = (
+        {"fold": 999}
+        if binding_field == "completed_receipt_identity"
+        else "tampered"
+    )
+    _publish_checkpoint_generation(
+        state,
+        state_dir,
+        role="latest_recovery",
+        epoch=999,
+    )
+
+    with pytest.raises(ValueError, match="not bound"):
+        run_track_a(
+            config,
+            run_id="state-binding",
+            resume=True,
+            fold_batch=(2,),
+            **common,
+        )
 
 
 def test_corrected_outer_test_is_touched_once_after_validation_freeze(
