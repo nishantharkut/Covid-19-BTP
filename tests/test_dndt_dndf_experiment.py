@@ -13,21 +13,29 @@ import pytest
 import torch
 
 from covid_rars.dndt_dndf_experiment import (
+    AuthorTrackAArtifacts,
+    EXPECTED_TRACK_A_SELECTED_INDICES,
     PREDICTION_COLUMNS,
     FitResult,
     PlannedInterruption,
+    TrackAFeatureCache,
     TrainConfig,
     _atomic_torch_save,
     _manifest_path,
     _publish_checkpoint_generation,
     _resolve_checkpoint_manifest,
     aggregate_participant_probabilities,
+    author_threshold_to_covid_threshold,
+    author_threshold_sweep,
     balance_training_rows,
     checkpoint_sha256,
     deterministic_batch_indices,
+    fixed_order_batch_indices,
     fit_model,
     fit_preprocessor,
     normalize_execution_backend,
+    prepare_track_a_rfecv_cache,
+    run_track_a,
     transform_features,
     validate_prediction_frame,
     write_predictions,
@@ -900,3 +908,324 @@ def test_cuda_resume_matches_uninterrupted_probabilities(tmp_path: Path) -> None
         tmp_path / "cuda-resume", role="latest_recovery", map_location="cpu"
     )
     assert resumed_latest.descriptor["sha256"] == full_latest.descriptor["sha256"]
+
+
+def _tiny_track_a_artifacts() -> AuthorTrackAArtifacts:
+    rng = np.random.default_rng(2026)
+    author_labels = np.array([0, 1] * 30, dtype=np.int64)
+    features = rng.normal(size=(60, 6)).astype(np.float64)
+    features[:, 0] += author_labels * 0.9
+    test_folds = tuple(np.asarray(part, dtype=np.int64) for part in np.array_split(np.arange(60), 3))
+    train_folds = tuple(
+        np.setdiff1d(np.arange(60), test, assume_unique=True) for test in test_folds
+    )
+    return AuthorTrackAArtifacts(
+        features=features,
+        author_labels=author_labels,
+        covid_labels=1 - author_labels,
+        train_folds=train_folds,
+        test_folds=test_folds,
+        source_hashes={"features": _sha("author-x"), "labels": _sha("author-y")},
+        fold_hashes={f"fold-{index}": _sha(f"fold-{index}") for index in range(3)},
+        author_commit="f" * 40,
+    )
+
+
+def _tiny_track_a_cache(tmp_path: Path) -> TrackAFeatureCache:
+    artifacts = _tiny_track_a_artifacts()
+    selected = artifacts.features[:, :4].copy()
+    selected_path = tmp_path / "cache" / "selected_features.npy"
+    indices_path = tmp_path / "cache" / "selected_indices.npy"
+    manifest_path = tmp_path / "cache" / "manifest.json"
+    selected_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(selected_path, selected)
+    np.save(indices_path, np.arange(4, dtype=np.int64))
+    manifest_path.write_text("{}\n", encoding="utf-8")
+    return TrackAFeatureCache(
+        selected_features=selected,
+        selected_indices=np.arange(4, dtype=np.int64),
+        cache_key=_sha("tiny-track-a-cache"),
+        selected_features_sha256=checkpoint_sha256(selected_path),
+        selected_indices_sha256=checkpoint_sha256(indices_path),
+        manifest_path=manifest_path,
+    )
+
+
+def _tiny_track_a_config(tmp_path: Path) -> dict[str, object]:
+    return {
+        "author_commit": "f" * 40,
+        "run_root": str(tmp_path / "runs"),
+        "device": "cpu",
+        "published": {
+            "depth": 2,
+            "used_features_rate": 1.0,
+            "learning_rate": 0.01,
+            "batch_size": 8,
+            "epochs": 2,
+            "dndt_trees": 1,
+            "dndf_trees": 2,
+        },
+        "selection": {"patience": 2},
+        "seeds": {"candidate": [42]},
+    }
+
+
+def test_fixed_order_batches_repeat_stable_rows_and_never_shuffle() -> None:
+    first = fixed_order_batch_indices(11, 4)
+    second = fixed_order_batch_indices(11, 4)
+
+    assert [batch.tolist() for batch in first] == [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10]]
+    assert [batch.tolist() for batch in second] == [batch.tolist() for batch in first]
+    assert np.concatenate(first).tolist() == list(range(11))
+
+
+def test_author_threshold_sweep_matches_independent_oracle_and_covid_confusion() -> None:
+    from sklearn.metrics import confusion_matrix, roc_auc_score
+
+    y_author = np.array([0, 0, 1, 1, 1, 0], dtype=np.int64)
+    probability_n = np.array([0.15, 0.45, 0.55, 0.85, 0.65, 0.25])
+    thresholds = np.arange(0.0, 1.0, 0.001)
+    scores = np.array(
+        [roc_auc_score(y_author, (probability_n >= threshold).astype(int)) for threshold in thresholds]
+    )
+
+    audit = author_threshold_sweep(y_author, probability_n)
+
+    expected_index = int(np.argmax(scores))
+    assert audit["author_threshold"] == pytest.approx(float(thresholds[expected_index]))
+    assert audit["paper_thresholded_auc"] == pytest.approx(float(scores[expected_index]))
+    y_covid = 1 - y_author
+    predicted_covid = 1 - (probability_n >= audit["author_threshold"]).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_covid, predicted_covid, labels=[0, 1]).ravel()
+    assert audit["tn"] == int(tn)
+    assert audit["fp"] == int(fp)
+    assert audit["fn"] == int(fn)
+    assert audit["tp"] == int(tp)
+    converted = author_threshold_to_covid_threshold(float(audit["author_threshold"]))
+    np.testing.assert_array_equal(
+        (1.0 - probability_n >= converted).astype(int),
+        predicted_covid,
+    )
+
+
+def test_rfecv_cache_is_global_hashed_and_recomputed_after_corruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifacts = _tiny_track_a_artifacts()
+    calls: list[tuple[int, int]] = []
+
+    class FakeRfecv:
+        def __init__(self, **kwargs: object) -> None:
+            assert kwargs["step"] == 1
+            assert kwargs["scoring"] == "roc_auc"
+            assert kwargs["min_features_to_select"] == 1
+
+        def fit(self, features: np.ndarray, labels: np.ndarray) -> FakeRfecv:
+            calls.append(features.shape)
+            self.support_ = np.array([True, False, True, False, True, False])
+            return self
+
+    import covid_rars.dndt_dndf_experiment as experiment
+
+    monkeypatch.setattr(experiment, "RFECV", FakeRfecv)
+    first = prepare_track_a_rfecv_cache(
+        artifacts,
+        tmp_path,
+        expected_indices=np.array([0, 2, 4]),
+    )
+    second = prepare_track_a_rfecv_cache(
+        artifacts,
+        tmp_path,
+        expected_indices=np.array([0, 2, 4]),
+    )
+
+    assert calls == [(48, 6)]
+    np.testing.assert_array_equal(first.selected_indices, [0, 2, 4])
+    np.testing.assert_array_equal(second.selected_features, artifacts.features[:, [0, 2, 4]])
+    assert first.cache_key == second.cache_key
+    assert json.loads(first.manifest_path.read_text(encoding="utf-8"))["rfecv_scope"] == "single_global_author_pass"
+
+    selected_path = first.manifest_path.parent / "selected_features.npy"
+    selected_path.write_bytes(b"corrupt")
+    repaired = prepare_track_a_rfecv_cache(
+        artifacts,
+        tmp_path,
+        expected_indices=np.array([0, 2, 4]),
+    )
+    assert calls == [(48, 6), (48, 6)]
+    np.testing.assert_array_equal(repaired.selected_features, artifacts.features[:, [0, 2, 4]])
+    assert not list(first.manifest_path.parent.glob("*.tmp"))
+
+
+def test_rfecv_expected_index_assertion_rejects_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifacts = _tiny_track_a_artifacts()
+
+    class WrongRfecv:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def fit(self, features: np.ndarray, labels: np.ndarray) -> WrongRfecv:
+            self.support_ = np.array([True, True, False, False, False, False])
+            return self
+
+    import covid_rars.dndt_dndf_experiment as experiment
+
+    monkeypatch.setattr(experiment, "RFECV", WrongRfecv)
+    with pytest.raises(RuntimeError, match="RFECV selected indices"):
+        prepare_track_a_rfecv_cache(
+            artifacts,
+            tmp_path,
+            expected_indices=np.array([0, 2, 4]),
+        )
+    assert len(EXPECTED_TRACK_A_SELECTED_INDICES) == 33
+
+
+def test_track_a_modes_record_identity_threshold_and_training_order_contracts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import covid_rars.dndt_dndf_experiment as experiment
+
+    artifacts = _tiny_track_a_artifacts()
+    cache = _tiny_track_a_cache(tmp_path)
+    identities: list[tuple[str, int, int]] = []
+    original = experiment._create_track_a_model_optimizer
+
+    def observing_factory(*args: object, **kwargs: object):
+        model, optimizer = original(*args, **kwargs)
+        identities.append((str(kwargs["mode"]), id(model), id(optimizer)))
+        return model, optimizer
+
+    monkeypatch.setattr(experiment, "_create_track_a_model_optimizer", observing_factory)
+    result = run_track_a(
+        _tiny_track_a_config(tmp_path),
+        run_id="identity-contract",
+        artifacts=artifacts,
+        feature_cache=cache,
+        fold_batch=(0, 1),
+        modes=("author_behaviour_audit", "corrected_reference"),
+        model_names=("dndt",),
+        code_revision="task4-test",
+        device="cpu",
+    )
+
+    author_ids = [(model, optimizer) for mode, model, optimizer in identities if mode == "author_behaviour_audit"]
+    corrected_ids = [(model, optimizer) for mode, model, optimizer in identities if mode == "corrected_reference"]
+    assert len(author_ids) == 1
+    assert len(corrected_ids) == 2
+    assert len(set(corrected_ids)) == 2
+    rows = pd.DataFrame(result["metrics"])
+    author = rows[rows["mode"] == "author_behaviour_audit"]
+    corrected = rows[rows["mode"] == "corrected_reference"]
+    assert author["threshold_source"].eq("test_balanced_accuracy_author_audit").all()
+    assert author["threshold_selected_on_outer_test"].eq(True).all()
+    assert author["model_reinitialized_per_fold"].eq(False).all()
+    assert author["optimizer_reinitialized_per_fold"].eq(False).all()
+    assert author["author_training_order"].eq("no_shuffle_repeated_dataset").all()
+    assert author["author_randomness_unseeded"].eq(True).all()
+    assert author["reconstruction_seed"].eq(42).all()
+    assert corrected["threshold_source"].eq("inner_validation_balanced_accuracy").all()
+    assert corrected["threshold_selected_on_outer_test"].eq(False).all()
+    assert corrected["model_reinitialized_per_fold"].eq(True).all()
+    assert corrected["outer_test_evaluation_count"].eq(1).all()
+
+
+def test_author_fold_batch_resume_matches_uninterrupted_and_writes_atomic_receipts(
+    tmp_path: Path,
+) -> None:
+    artifacts = _tiny_track_a_artifacts()
+    cache = _tiny_track_a_cache(tmp_path)
+    config = _tiny_track_a_config(tmp_path)
+    common = dict(
+        artifacts=artifacts,
+        feature_cache=cache,
+        fold_batch=(0, 1),
+        modes=("author_behaviour_audit",),
+        model_names=("dndt",),
+        code_revision="task4-resume-test",
+        device="cpu",
+    )
+    full = run_track_a(config, run_id="full", **common)
+
+    with pytest.raises(PlannedInterruption):
+        run_track_a(
+            config,
+            run_id="resumed",
+            interrupt_after=("author_behaviour_audit", "dndt", 0, 1),
+            **common,
+        )
+    resumed = run_track_a(config, run_id="resumed", resume=True, **common)
+    completed_resume = run_track_a(config, run_id="resumed", resume=True, **common)
+
+    full_predictions = pd.DataFrame(full["predictions"]).sort_values(
+        ["model_name", "fold", "analysis_id"]
+    ).reset_index(drop=True)
+    resumed_predictions = pd.DataFrame(resumed["predictions"]).sort_values(
+        ["model_name", "fold", "analysis_id"]
+    ).reset_index(drop=True)
+    pd.testing.assert_frame_equal(
+        full_predictions.drop(columns="run_id"),
+        resumed_predictions.drop(columns="run_id"),
+    )
+    assert len(completed_resume["predictions"]) == len(resumed["predictions"])
+    receipt_paths = list((tmp_path / "runs" / "resumed").rglob("receipt.json"))
+    assert len(receipt_paths) == 2
+    for receipt_path in receipt_paths:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        assert receipt["status"] == "complete"
+        assert receipt["feature_sha256"] == cache.selected_features_sha256
+        assert receipt["author_commit"] == artifacts.author_commit
+    assert not list((tmp_path / "runs" / "resumed").rglob("*.tmp"))
+
+    prediction_path = receipt_paths[0].parent / "predictions.csv"
+    prediction_path.write_text(
+        prediction_path.read_text(encoding="utf-8") + "\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="missing or invalid fold receipt"):
+        run_track_a(config, run_id="resumed", resume=True, **common)
+
+
+def test_corrected_outer_test_is_touched_once_after_validation_freeze(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import covid_rars.dndt_dndf_experiment as experiment
+
+    artifacts = _tiny_track_a_artifacts()
+    cache = _tiny_track_a_cache(tmp_path)
+    calls: list[np.ndarray] = []
+    original = experiment._predict_track_a_outer_test
+
+    def sentinel(
+        model: torch.nn.Module,
+        selected_features: np.ndarray,
+        test_indices: np.ndarray,
+        *,
+        device: torch.device,
+    ) -> np.ndarray:
+        assert model.training is False
+        calls.append(test_indices.copy())
+        return original(
+            model,
+            selected_features,
+            test_indices,
+            device=device,
+        )
+
+    monkeypatch.setattr(experiment, "_predict_track_a_outer_test", sentinel)
+    run_track_a(
+        _tiny_track_a_config(tmp_path),
+        run_id="outer-test-sentinel",
+        artifacts=artifacts,
+        feature_cache=cache,
+        fold_batch=(0,),
+        modes=("corrected_reference",),
+        model_names=("dndt",),
+        code_revision="task4-sentinel-test",
+        device="cpu",
+    )
+
+    assert len(calls) == 1
+    np.testing.assert_array_equal(calls[0], artifacts.test_folds[0])
+    prepare_track_a_rfecv_cache,
+    run_track_a,

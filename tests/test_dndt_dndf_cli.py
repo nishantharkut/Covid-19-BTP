@@ -34,6 +34,15 @@ def _load_preflight() -> ModuleType:
     return module
 
 
+def _load_track_a_cli() -> ModuleType:
+    script_path = PROJECT_ROOT / "scripts" / "80_run_dndt_dndf_track_a.py"
+    spec = importlib.util.spec_from_file_location("dndt_dndf_track_a_cli", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _write_csv(path: Path, header: list[str], row: list[object] | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -156,6 +165,24 @@ def _write_author_repo(path: Path) -> tuple[str, Path, Path]:
         text=True,
     ).stdout.strip()
     return commit, x_path, y_path
+
+
+def _author_artifact_hashes(author_repo: Path) -> dict[str, str]:
+    relative_paths = [
+        Path("Extracted Features/Coswara/cough_X_features_np.npy"),
+        Path("Extracted Features/Coswara/cough_y_features_np.npy"),
+    ]
+    for fold in range(10):
+        relative_paths.extend(
+            [
+                Path(f"Train-Test Split/coswaradataset/train/{fold}.csv"),
+                Path(f"Train-Test Split/coswaradataset/test/{fold}.csv"),
+            ]
+        )
+    return {
+        relative.as_posix(): _sha256(author_repo / relative)
+        for relative in relative_paths
+    }
 
 
 def test_dependency_and_config_contracts_are_exact() -> None:
@@ -557,3 +584,139 @@ def test_run_preflight_and_cli_emit_blocked_json_without_real_data(
     assert exc_info.value.code == 1
     output = json.loads(capsys.readouterr().out)
     assert output["status"] == "blocked"
+
+
+def test_track_a_loader_enforces_exact_artifacts_hashes_and_label_orientations(
+    tmp_path: Path,
+) -> None:
+    from covid_rars.dndt_dndf_experiment import load_track_a_author_artifacts
+
+    author_repo = tmp_path / "author"
+    commit, _, _ = _write_author_repo(author_repo)
+    expected_hashes = _author_artifact_hashes(author_repo)
+
+    artifacts = load_track_a_author_artifacts(
+        author_repo,
+        commit,
+        expected_hashes=expected_hashes,
+    )
+
+    assert artifacts.features.shape == (1319, 193)
+    assert np.issubdtype(artifacts.features.dtype, np.floating)
+    assert np.isfinite(artifacts.features).all()
+    assert np.count_nonzero(artifacts.author_labels == 0) == 185
+    assert np.count_nonzero(artifacts.author_labels == 1) == 1134
+    np.testing.assert_array_equal(artifacts.covid_labels, 1 - artifacts.author_labels)
+    assert np.all(artifacts.covid_labels[:185] == 1)
+    assert np.all(artifacts.covid_labels[185:] == 0)
+    combined = np.concatenate(artifacts.test_folds)
+    np.testing.assert_array_equal(np.sort(combined), np.arange(1319))
+    assert len(np.unique(combined)) == 1319
+    assert len(artifacts.fold_hashes) == 20
+
+    first_test = author_repo / "Train-Test Split" / "coswaradataset" / "test" / "0.csv"
+    first_test.write_text(first_test.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="SHA256 mismatch"):
+        load_track_a_author_artifacts(
+            author_repo,
+            commit,
+            expected_hashes=expected_hashes,
+            require_clean_tracked_tree=False,
+        )
+
+
+def test_track_a_loader_rejects_nonfinite_features_even_with_matching_hash(
+    tmp_path: Path,
+) -> None:
+    from covid_rars.dndt_dndf_experiment import load_track_a_author_artifacts
+
+    author_repo = tmp_path / "author"
+    commit, x_path, _ = _write_author_repo(author_repo)
+    features = np.load(x_path)
+    features[0, 0] = np.inf
+    np.save(x_path, features)
+    expected_hashes = _author_artifact_hashes(author_repo)
+
+    with pytest.raises(ValueError, match="finite"):
+        load_track_a_author_artifacts(
+            author_repo,
+            commit,
+            expected_hashes=expected_hashes,
+            require_clean_tracked_tree=False,
+        )
+
+
+def test_track_a_fold_batch_parser_and_cli_smoke_are_machine_readable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    module = _load_track_a_cli()
+    assert module.parse_fold_batch(None) == tuple(range(10))
+    assert module.parse_fold_batch("2-4") == (2, 3, 4)
+    assert module.parse_fold_batch("0,3,9") == (0, 3, 9)
+    with pytest.raises(ValueError):
+        module.parse_fold_batch("4-2")
+    with pytest.raises(ValueError):
+        module.parse_fold_batch("0,10")
+
+    config_path = tmp_path / "config.json"
+    original = {"run_root": str(tmp_path / "runs"), "device": "cpu"}
+    config_path.write_text(json.dumps(original), encoding="utf-8")
+    observed: dict[str, object] = {}
+
+    def fake_runner(config: dict[str, object], **kwargs: object) -> dict[str, object]:
+        observed.update(kwargs)
+        assert config == original
+        return {"status": "complete", "completed_units": 4, "total_units": 4}
+
+    exit_code = module.main(
+        [
+            "--config",
+            str(config_path),
+            "--run-id",
+            "smoke-contract",
+            "--resume",
+            "--smoke",
+            "--fold-batch",
+            "0-3",
+        ],
+        runner=fake_runner,
+    )
+
+    assert exit_code == 0
+    assert observed["run_id"] == "smoke-contract-smoke"
+    assert observed["resume"] is True
+    assert observed["smoke"] is True
+    assert observed["fold_batch"] == (0,)
+    assert json.loads(config_path.read_text(encoding="utf-8")) == original
+    assert json.loads(capsys.readouterr().out)["status"] == "complete"
+
+
+def test_author_mode_rejects_late_fold_batch_without_preceding_state(
+    tmp_path: Path,
+) -> None:
+    from covid_rars.dndt_dndf_experiment import run_track_a
+
+    with pytest.raises(ValueError, match="preceding state"):
+        run_track_a(
+            {
+                "run_root": str(tmp_path / "runs"),
+                "device": "cpu",
+                "published": {
+                    "depth": 2,
+                    "used_features_rate": 1.0,
+                    "learning_rate": 0.01,
+                    "batch_size": 8,
+                    "epochs": 2,
+                    "dndt_trees": 1,
+                    "dndf_trees": 2,
+                },
+                "selection": {"patience": 2},
+                "seeds": {"candidate": [42]},
+            },
+            run_id="late-start",
+            fold_batch=(1,),
+            modes=("author_behaviour_audit",),
+            model_names=("dndt",),
+            code_revision="task4-test",
+            device="cpu",
+        )
