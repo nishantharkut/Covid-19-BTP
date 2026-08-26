@@ -5,6 +5,7 @@ import io
 import inspect
 import json
 import math
+import multiprocessing
 import os
 import shutil
 import threading
@@ -62,6 +63,108 @@ class _MaliciousCheckpointValue:
 
     def __reduce__(self) -> tuple[object, tuple[str]]:
         return _malicious_checkpoint_side_effect, (str(self.marker),)
+
+
+def _rfecv_lock_contention_worker(
+    lock_path_value: str,
+    output_path_value: str,
+    start_path_value: str,
+    worker_id: int,
+    iterations: int,
+) -> None:
+    lock_path = Path(lock_path_value)
+    output_path = Path(output_path_value)
+    start_path = Path(start_path_value)
+    guard_path = lock_path.with_suffix(".guard")
+    deadline = time.monotonic() + 15.0
+    while not start_path.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("contention worker did not receive start signal")
+        time.sleep(0.005)
+    for iteration in range(iterations):
+        with _exclusive_rfecv_cache_lock(
+            lock_path,
+            timeout=15.0,
+            retry_interval=0.005,
+        ):
+            if guard_path.exists():
+                raise RuntimeError("more than one process entered the lock")
+            guard_path.write_text(str(worker_id), encoding="ascii")
+            try:
+                with output_path.open("a", encoding="ascii", newline="\n") as handle:
+                    handle.write(f"{worker_id}:{iteration}\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                time.sleep(0.002)
+            finally:
+                guard_path.unlink(missing_ok=True)
+
+
+def _rfecv_lock_holder_worker(lock_path_value: str, acquired_path_value: str) -> None:
+    with _exclusive_rfecv_cache_lock(
+        Path(lock_path_value), timeout=10.0, retry_interval=0.005
+    ):
+        Path(acquired_path_value).write_text("held", encoding="ascii")
+        while True:
+            time.sleep(1.0)
+
+
+def _rfecv_lock_waiter_worker(lock_path_value: str, acquired_path_value: str) -> None:
+    with _exclusive_rfecv_cache_lock(
+        Path(lock_path_value), timeout=10.0, retry_interval=0.005
+    ):
+        Path(acquired_path_value).write_text("acquired", encoding="ascii")
+
+
+def _rfecv_prepare_worker(
+    run_root_value: str,
+    start_path_value: str,
+    ready_path_value: str,
+    result_path_value: str,
+    computation_path_value: str,
+) -> None:
+    import covid_rars.dndt_dndf_experiment as experiment
+
+    class SlowRfecv:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def fit(self, features: np.ndarray, labels: np.ndarray) -> SlowRfecv:
+            del labels
+            with Path(computation_path_value).open(
+                "a", encoding="ascii", newline="\n"
+            ) as handle:
+                handle.write(f"{features.shape[0]}\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            time.sleep(0.25)
+            self.support_ = np.array([True, False, True, False, True, False])
+            return self
+
+    experiment.RFECV = SlowRfecv
+    start_path = Path(start_path_value)
+    Path(ready_path_value).write_text("ready", encoding="ascii")
+    deadline = time.monotonic() + 15.0
+    while not start_path.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("RFECV prepare worker did not receive start signal")
+        time.sleep(0.005)
+    cache = prepare_track_a_rfecv_cache(
+        _tiny_track_a_artifacts(),
+        Path(run_root_value),
+        expected_indices=np.array([0, 2, 4]),
+    )
+    Path(result_path_value).write_text(
+        json.dumps(
+            {
+                "cache_key": cache.cache_key,
+                "features_sha256": cache.selected_features_sha256,
+                "indices_sha256": cache.selected_indices_sha256,
+            },
+            sort_keys=True,
+        ),
+        encoding="ascii",
+    )
 
 
 def _sha(value: str) -> str:
@@ -1347,7 +1450,8 @@ def test_rfecv_cache_concurrent_build_publishes_once_without_partial_artifacts(
     import covid_rars.dndt_dndf_experiment as experiment
 
     artifacts = _tiny_track_a_artifacts()
-    barrier = threading.Barrier(2)
+    worker_count = 8
+    barrier = threading.Barrier(worker_count)
     calls: list[int] = []
     calls_lock = threading.Lock()
 
@@ -1380,7 +1484,7 @@ def test_rfecv_cache_concurrent_build_publishes_once_without_partial_artifacts(
         except BaseException as exc:  # pragma: no branch - asserted below
             errors.append(exc)
 
-    threads = [threading.Thread(target=worker) for _ in range(2)]
+    threads = [threading.Thread(target=worker) for _ in range(worker_count)]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -1389,70 +1493,217 @@ def test_rfecv_cache_concurrent_build_publishes_once_without_partial_artifacts(
     assert not any(thread.is_alive() for thread in threads)
     assert errors == []
     assert calls == [48]
-    assert len(results) == 2
-    assert results[0].cache_key == results[1].cache_key
-    np.testing.assert_array_equal(
-        results[0].selected_features,
-        results[1].selected_features,
-    )
+    assert len(results) == worker_count
+    assert {result.cache_key for result in results} == {results[0].cache_key}
+    for result in results[1:]:
+        np.testing.assert_array_equal(
+            results[0].selected_features,
+            result.selected_features,
+        )
     cache_dir = results[0].manifest_path.parent
     assert not list(cache_dir.glob("*.tmp"))
-    assert not (cache_dir / ".rfecv-cache.lock").exists()
+    assert (cache_dir / ".rfecv-cache.lock").is_file()
+    assert len(list(cache_dir.glob("manifest.json"))) == 1
+    assert len(list(cache_dir.glob("selected_features.npy"))) == 1
+    assert len(list(cache_dir.glob("selected_indices.npy"))) == 1
 
 
-def test_rfecv_lock_recovers_stale_dead_owner_and_times_out_for_live_owner(
+def test_rfecv_cache_waiting_processes_revalidate_and_publish_once(
     tmp_path: Path,
 ) -> None:
+    context = multiprocessing.get_context("spawn")
+    process_count = 4
+    start_path = tmp_path / "start"
+    computation_path = tmp_path / "rfecv-computations.txt"
+    ready_paths = [tmp_path / f"ready-{worker}" for worker in range(process_count)]
+    result_paths = [tmp_path / f"result-{worker}.json" for worker in range(process_count)]
+    processes = [
+        context.Process(
+            target=_rfecv_prepare_worker,
+            args=(
+                str(tmp_path),
+                str(start_path),
+                str(ready_paths[worker]),
+                str(result_paths[worker]),
+                str(computation_path),
+            ),
+        )
+        for worker in range(process_count)
+    ]
+    for process in processes:
+        process.start()
+    try:
+        deadline = time.monotonic() + 20.0
+        while not all(path.exists() for path in ready_paths):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("RFECV prepare workers did not become ready")
+            time.sleep(0.01)
+        start_path.write_text("start", encoding="ascii")
+        for process in processes:
+            process.join(timeout=20)
+
+        assert not any(process.is_alive() for process in processes)
+        assert [process.exitcode for process in processes] == [0] * process_count
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5)
+
+    assert computation_path.read_text(encoding="ascii").splitlines() == ["48"]
+    results = [json.loads(path.read_text(encoding="ascii")) for path in result_paths]
+    assert len({json.dumps(result, sort_keys=True) for result in results}) == 1
+
+    cache_dirs = list((tmp_path / "cache").glob("track_a_rfecv_*"))
+    assert len(cache_dirs) == 1
+    cache_dir = cache_dirs[0]
+    assert {path.name for path in cache_dir.iterdir()} == {
+        ".rfecv-cache.lock",
+        "manifest.json",
+        "selected_features.npy",
+        "selected_indices.npy",
+    }
+    manifest = json.loads((cache_dir / "manifest.json").read_text(encoding="utf-8"))
+    selected_features_path = cache_dir / "selected_features.npy"
+    selected_indices_path = cache_dir / "selected_indices.npy"
+    assert checkpoint_sha256(selected_features_path) == manifest[
+        "selected_features_sha256"
+    ]
+    assert checkpoint_sha256(selected_indices_path) == manifest[
+        "selected_indices_sha256"
+    ]
+    selected_indices = np.load(selected_indices_path, allow_pickle=False)
+    selected_features = np.load(selected_features_path, allow_pickle=False)
+    np.testing.assert_array_equal(selected_indices, [0, 2, 4])
+    np.testing.assert_array_equal(
+        selected_features,
+        _tiny_track_a_artifacts().features[:, [0, 2, 4]],
+    )
+
+
+@pytest.mark.parametrize("round_index", range(3))
+def test_rfecv_os_lock_survives_repeated_process_contention(
+    tmp_path: Path,
+    round_index: int,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    lock_path = tmp_path / f"round-{round_index}.lock"
+    output_path = tmp_path / f"round-{round_index}.txt"
+    start_path = tmp_path / f"round-{round_index}.start"
+    process_count = 6
+    iterations = 8
+    processes = [
+        context.Process(
+            target=_rfecv_lock_contention_worker,
+            args=(str(lock_path), str(output_path), str(start_path), worker, iterations),
+        )
+        for worker in range(process_count)
+    ]
+    for process in processes:
+        process.start()
+    start_path.write_text("start", encoding="ascii")
+    for process in processes:
+        process.join(timeout=30)
+
+    assert not any(process.is_alive() for process in processes)
+    assert [process.exitcode for process in processes] == [0] * process_count
+    assert lock_path.is_file()
+    assert not lock_path.with_suffix(".guard").exists()
+    lines = output_path.read_text(encoding="ascii").splitlines()
+    assert len(lines) == process_count * iterations
+    assert len(set(lines)) == process_count * iterations
+
+
+def test_rfecv_os_lock_is_released_immediately_when_owner_process_dies(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("spawn")
     lock_path = tmp_path / ".rfecv-cache.lock"
-    lock_path.write_text(
-        json.dumps(
-            {
-                "format_version": 1,
-                "token": "dead",
-                "pid": 2_147_483_000,
-                "hostname": __import__("socket").gethostname(),
-                "created_at": time.time(),
-            }
-        ),
-        encoding="utf-8",
+    acquired_path = tmp_path / "owner-acquired"
+    owner = context.Process(
+        target=_rfecv_lock_holder_worker,
+        args=(str(lock_path), str(acquired_path)),
     )
+    owner.start()
+    deadline = time.monotonic() + 10.0
+    while not acquired_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert acquired_path.exists()
+
+    owner.kill()
+    owner.join(timeout=10)
+    assert not owner.is_alive()
     with _exclusive_rfecv_cache_lock(
         lock_path,
-        timeout=0.5,
-        stale_after=60.0,
+        timeout=1.0,
+        retry_interval=0.005,
     ):
         assert lock_path.is_file()
-    assert not lock_path.exists()
+    assert lock_path.is_file()
 
-    lock_path.write_text("[]\n", encoding="utf-8")
-    os.utime(lock_path, (1.0, 1.0))
+
+def test_rfecv_delayed_waiter_never_invalidates_current_owner(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    lock_path = tmp_path / ".rfecv-cache.lock"
+    waiter_acquired_path = tmp_path / "waiter-acquired"
+
     with _exclusive_rfecv_cache_lock(
         lock_path,
-        timeout=0.5,
-        stale_after=0.0,
+        timeout=1.0,
+        retry_interval=0.005,
     ):
+        waiter = context.Process(
+            target=_rfecv_lock_waiter_worker,
+            args=(str(lock_path), str(waiter_acquired_path)),
+        )
+        waiter.start()
+        time.sleep(0.5)
+        assert waiter.is_alive()
+        assert not waiter_acquired_path.exists()
         assert lock_path.is_file()
-    assert not lock_path.exists()
 
-    lock_path.write_text(
-        json.dumps(
-            {
-                "format_version": 1,
-                "token": "live",
-                "pid": __import__("os").getpid(),
-                "hostname": __import__("socket").gethostname(),
-                "created_at": time.time(),
-            }
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(TimeoutError, match="RFECV cache lock"):
-        with _exclusive_rfecv_cache_lock(
-            lock_path,
-            timeout=0.05,
-            stale_after=60.0,
-        ):
-            raise AssertionError("live lock must not be acquired")
+    waiter.join(timeout=10)
+    assert not waiter.is_alive()
+    assert waiter.exitcode == 0
+    assert waiter_acquired_path.read_text(encoding="ascii") == "acquired"
+    assert lock_path.is_file()
+
+
+def test_rfecv_os_lock_timeout_is_bounded_and_actionable(tmp_path: Path) -> None:
+    lock_path = tmp_path / ".rfecv-cache.lock"
+    with _exclusive_rfecv_cache_lock(lock_path, timeout=1.0, retry_interval=0.005):
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match=r"RFECV cache lock.*0\.05.*lock"):
+            with _exclusive_rfecv_cache_lock(
+                lock_path,
+                timeout=0.05,
+                retry_interval=0.005,
+            ):
+                raise AssertionError("locked byte must not be acquired")
+        assert time.monotonic() - started < 0.5
+
+
+def test_rfecv_os_lock_closes_handle_when_initialization_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingHandle:
+        closed = False
+
+        def seek(self, *_: object) -> None:
+            raise OSError("forced lock handle initialization failure")
+
+        def close(self) -> None:
+            self.closed = True
+
+    handle = FailingHandle()
+    monkeypatch.setattr(Path, "open", lambda *_args, **_kwargs: handle)
+
+    with pytest.raises(OSError, match="initialization failure"):
+        with _exclusive_rfecv_cache_lock(tmp_path / ".rfecv-cache.lock"):
+            raise AssertionError("lock acquisition must not be reached")
+
+    assert handle.closed
 
 
 def test_rfecv_expected_index_assertion_rejects_drift(

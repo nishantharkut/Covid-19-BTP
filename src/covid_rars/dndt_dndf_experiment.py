@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import csv
-import ctypes
 import hashlib
 import io
 import json
@@ -10,7 +9,6 @@ import math
 import os
 import random
 import re
-import socket
 import subprocess
 import time
 import uuid
@@ -45,7 +43,7 @@ _CHECKPOINT_ROLES: dict[str, str] = {
 }
 _MAX_DEFERRED_CLEANUP_FILENAMES = 32
 _RFECV_LOCK_TIMEOUT_SECONDS = 300.0
-_RFECV_STALE_LOCK_SECONDS = 6.0 * 60.0 * 60.0
+_RFECV_LOCK_RETRY_SECONDS = 0.05
 SMOTE_K_NEIGHBORS = 5
 SVMSMOTE_K_NEIGHBORS = 5
 SVMSMOTE_M_NEIGHBORS = 10
@@ -646,116 +644,61 @@ def _atomic_numpy_save(array: np.ndarray, path: Path) -> str:
     return checkpoint_sha256(path)
 
 
-def _pid_is_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        process_query_limited_information = 0x1000
-        handle = ctypes.windll.kernel32.OpenProcess(  # type: ignore[attr-defined]
-            process_query_limited_information,
-            False,
-            pid,
-        )
-        if handle:
-            ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
-            return True
-        return ctypes.windll.kernel32.GetLastError() == 5  # type: ignore[attr-defined]
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _remove_stale_lock(path: Path, *, stale_after: float) -> bool:
-    try:
-        stat = path.stat()
-        raw = path.read_text(encoding="utf-8")
-        owner = json.loads(raw)
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        try:
-            malformed_grace = min(stale_after, 5.0)
-            if time.time() - path.stat().st_mtime <= malformed_grace:
-                return False
-        except OSError:
-            return True
-    else:
-        if not isinstance(owner, dict):
-            malformed_grace = min(stale_after, 5.0)
-            if time.time() - stat.st_mtime <= malformed_grace:
-                return False
-            return _unlink_lock(path)
-        age = time.time() - float(owner.get("created_at", stat.st_mtime))
-        owner_host = owner.get("hostname")
-        owner_pid = owner.get("pid")
-        if owner_host == socket.gethostname() and isinstance(owner_pid, int):
-            return False if _pid_is_running(owner_pid) else _unlink_lock(path)
-        if age <= stale_after:
-            return False
-    return _unlink_lock(path)
-
-
-def _unlink_lock(path: Path) -> bool:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False
-    return True
-
-
 @contextmanager
 def _exclusive_rfecv_cache_lock(
     path: Path,
     *,
     timeout: float = _RFECV_LOCK_TIMEOUT_SECONDS,
-    stale_after: float = _RFECV_STALE_LOCK_SECONDS,
+    retry_interval: float = _RFECV_LOCK_RETRY_SECONDS,
 ):
+    if timeout <= 0:
+        raise ValueError("RFECV cache lock timeout must be positive")
+    if retry_interval <= 0:
+        raise ValueError("RFECV cache lock retry_interval must be positive")
     path.parent.mkdir(parents=True, exist_ok=True)
-    token = uuid.uuid4().hex
-    owner = {
-        "format_version": 1,
-        "token": token,
-        "pid": os.getpid(),
-        "hostname": socket.gethostname(),
-        "created_at": time.time(),
-    }
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            descriptor = os.open(
-                path,
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                0o600,
-            )
-        except FileExistsError:
-            if _remove_stale_lock(path, stale_after=stale_after):
-                continue
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"timed out waiting for RFECV cache lock: {path}")
-            time.sleep(0.05)
-            continue
-        try:
-            encoded = (
-                json.dumps(owner, sort_keys=True, separators=(",", ":")) + "\n"
-            ).encode("utf-8")
-            os.write(descriptor, encoded)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        break
+    handle = path.open("a+b", buffering=0)
     try:
-        yield
-    finally:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+            os.fsync(handle.fileno())
+        deadline = time.monotonic() + timeout
+        acquired = False
+        while not acquired:
+            handle.seek(0)
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "RFECV cache lock timeout after "
+                        f"{timeout:.3f}s for {path}; another process may be "
+                        "building the cache"
+                    ) from exc
+                time.sleep(retry_interval)
         try:
-            current = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(current, dict) and current.get("token") == token:
-                path.unlink(missing_ok=True)
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            pass
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
 
 
 def _track_a_rfecv_payload(artifacts: AuthorTrackAArtifacts) -> dict[str, object]:
