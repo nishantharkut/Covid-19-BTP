@@ -203,12 +203,21 @@ class TrackAFoldContext:
     split_sha256: str
     code_revision: str
     threshold_source: str
+    reconstruction_seed: int
     checkpoint_path: Path
     checkpoint_sha256: str
 
     @property
     def protocol(self) -> str:
         return f"author_released_10fold_{self.mode}"
+
+    @property
+    def author_training_order(self) -> str:
+        return (
+            "no_shuffle_repeated_dataset"
+            if self.mode == "author_behaviour_audit"
+            else "deterministic_per_epoch_shuffle"
+        )
 
 
 class PlannedInterruption(RuntimeError):
@@ -627,6 +636,7 @@ def _atomic_numpy_save(array: np.ndarray, path: Path) -> str:
 def _track_a_rfecv_payload(artifacts: AuthorTrackAArtifacts) -> dict[str, object]:
     return {
         "source_hashes": artifacts.source_hashes,
+        "rfecv_scope": "single_global_author_pass",
         "algorithm": {
             "split": {"test_size": 0.20, "random_state": 42},
             "estimator": {
@@ -659,6 +669,16 @@ def _load_valid_track_a_cache(
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if not isinstance(manifest, dict):
+            return None
+        expected_manifest_fields = set(expected_payload) | {
+            "cache_key",
+            "selected_count",
+            "selected_indices",
+            "selected_features_shape",
+            "selected_features_sha256",
+            "selected_indices_sha256",
+        }
+        if set(manifest) != expected_manifest_fields:
             return None
         manifest_payload = {
             key: manifest.get(key) for key in expected_payload
@@ -763,7 +783,6 @@ def prepare_track_a_rfecv_cache(
     manifest = {
         **payload,
         "cache_key": cache_key,
-        "rfecv_scope": "single_global_author_pass",
         "selected_count": int(len(selected_indices)),
         "selected_indices": selected_indices.tolist(),
         "selected_features_shape": list(selected_features.shape),
@@ -2206,7 +2225,9 @@ def _track_a_receipt_identity(
     context: TrackAFoldContext,
     fold_dir: Path,
 ) -> dict[str, object]:
-    return {
+    predictions_path = fold_dir / "predictions.csv"
+    metrics_path = fold_dir / "metrics.json"
+    identity = {
         "status": "complete",
         "run_id": context.run_id,
         "track": "A",
@@ -2229,7 +2250,15 @@ def _track_a_receipt_identity(
             fold_dir,
         ),
         "checkpoint_sha256": context.checkpoint_sha256,
+        "predictions_sha256": checkpoint_sha256(predictions_path),
+        "metrics_sha256": checkpoint_sha256(metrics_path),
+        "global_feature_selection_retained": True,
+        "released_preprocessed_array_retained": True,
+        "author_training_order": context.author_training_order,
+        "author_randomness_unseeded": True,
+        "reconstruction_seed": context.reconstruction_seed,
     }
+    return identity
 
 
 def _require_track_a_prediction_identity(
@@ -2282,6 +2311,11 @@ def _require_track_a_metric_identity(
         "code_revision": context.code_revision,
         "threshold_source": context.threshold_source,
         "checkpoint_sha256": context.checkpoint_sha256,
+        "global_feature_selection_retained": True,
+        "released_preprocessed_array_retained": True,
+        "author_training_order": context.author_training_order,
+        "author_randomness_unseeded": True,
+        "reconstruction_seed": context.reconstruction_seed,
     }
     for field, value in expected.items():
         if metric.get(field) != value:
@@ -2309,16 +2343,7 @@ def _write_track_a_fold_outputs(
         for key, value in metric.items()
     }
     _atomic_json_write(serializable_metric, metrics_path)
-    receipt = {
-        **_track_a_receipt_identity(context, fold_dir),
-        "predictions_sha256": checkpoint_sha256(predictions_path),
-        "metrics_sha256": checkpoint_sha256(metrics_path),
-        "global_feature_selection_retained": True,
-        "released_preprocessed_array_retained": True,
-        "author_training_order": metric["author_training_order"],
-        "author_randomness_unseeded": True,
-        "reconstruction_seed": metric["reconstruction_seed"],
-    }
+    receipt = _track_a_receipt_identity(context, fold_dir)
     receipt_path = fold_dir / "receipt.json"
     _atomic_json_write(receipt, receipt_path)
     return receipt_path
@@ -2344,6 +2369,8 @@ def _load_completed_track_a_fold(
         if not isinstance(receipt, dict):
             raise ValueError("authenticated fold receipt must be a JSON object")
         expected_receipt = _track_a_receipt_identity(expected, fold_dir)
+        if set(receipt) != set(expected_receipt):
+            raise ValueError("authenticated fold receipt schema mismatch")
         for field, value in expected_receipt.items():
             if receipt.get(field) != value:
                 raise ValueError(
@@ -2427,6 +2454,7 @@ def _track_a_author_fold_context(
     feature_cache: TrackAFeatureCache,
     configuration_sha256: str,
     code_revision: str,
+    reconstruction_seed: int,
 ) -> TrackAFoldContext:
     fold_dir = (
         run_dir
@@ -2449,6 +2477,7 @@ def _track_a_author_fold_context(
         split_sha256=_track_a_author_split_sha256(artifacts, fold),
         code_revision=code_revision,
         threshold_source="test_balanced_accuracy_author_audit",
+        reconstruction_seed=reconstruction_seed,
         checkpoint_path=inference.path,
         checkpoint_sha256=str(inference.descriptor["sha256"]),
     )
@@ -2485,6 +2514,7 @@ def _validate_track_a_author_receipt_chain(
     feature_cache: TrackAFeatureCache,
     configuration_sha256: str,
     code_revision: str,
+    reconstruction_seed: int,
     state: Mapping[str, object],
 ) -> tuple[dict[int, tuple[pd.DataFrame, dict[str, object]]], dict[str, object]]:
     completed: dict[int, tuple[pd.DataFrame, dict[str, object]]] = {}
@@ -2507,6 +2537,7 @@ def _validate_track_a_author_receipt_chain(
                 feature_cache=feature_cache,
                 configuration_sha256=configuration_sha256,
                 code_revision=code_revision,
+                reconstruction_seed=reconstruction_seed,
             )
             loaded = _load_completed_track_a_fold(fold_dir, expected=context)
         except (FileNotFoundError, RuntimeError, ValueError) as exc:
@@ -2533,6 +2564,37 @@ def _validate_track_a_author_receipt_chain(
     return completed, latest_binding
 
 
+def _publish_track_a_author_between_fold_state(
+    *,
+    state_dir: Path,
+    configuration_sha256: str,
+    model: NeuralDecisionClassifier,
+    optimizer: torch.optim.Optimizer,
+    completed_fold: int,
+    fold_batch: Sequence[int],
+    epochs_per_fold: int,
+    receipt_binding: Mapping[str, object],
+) -> ResolvedCheckpoint:
+    return _publish_checkpoint_generation(
+        {
+            "format_version": 1,
+            "checkpoint_role": "latest_recovery",
+            "track_a_configuration_sha256": configuration_sha256,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "next_fold": completed_fold + 1,
+            "completed_epoch": 0,
+            "phase": "between_folds",
+            "fold_batch": list(fold_batch),
+            "rng_state": _rng_state(),
+            **receipt_binding,
+        },
+        state_dir,
+        role="latest_recovery",
+        epoch=(completed_fold + 1) * epochs_per_fold,
+    )
+
+
 def run_track_a(
     config: Mapping[str, object],
     *,
@@ -2547,6 +2609,7 @@ def run_track_a(
     code_revision: str,
     device: str | torch.device | None = None,
     interrupt_after: tuple[str, str, int, int] | None = None,
+    interrupt_after_receipt: tuple[str, str, int] | None = None,
 ) -> dict[str, object]:
     if not isinstance(run_id, str) or not run_id.strip():
         raise ValueError("run_id must be a nonempty string")
@@ -2711,9 +2774,63 @@ def run_track_a(
                         feature_cache=feature_cache,
                         configuration_sha256=configuration_sha,
                         code_revision=code_revision,
+                        reconstruction_seed=reconstruction_seed,
                         state=state,
                     )
                 )
+                if resume and phase == "trained":
+                    completed_fold = next_fold
+                    completed_fold_dir = (
+                        run_dir
+                        / "track_a"
+                        / mode
+                        / model_name
+                        / f"fold_{completed_fold:02d}"
+                    )
+                    completion_files = tuple(
+                        completed_fold_dir / name
+                        for name in ("receipt.json", "predictions.csv", "metrics.json")
+                    )
+                    if any(path.exists() for path in completion_files):
+                        completed_context = _track_a_author_fold_context(
+                            run_dir=run_dir,
+                            run_id=run_id,
+                            fold=completed_fold,
+                            model_name=model_name,
+                            artifacts=artifacts,
+                            feature_cache=feature_cache,
+                            configuration_sha256=configuration_sha,
+                            code_revision=code_revision,
+                            reconstruction_seed=reconstruction_seed,
+                        )
+                        completed_output = _load_completed_track_a_fold(
+                            completed_fold_dir,
+                            expected=completed_context,
+                        )
+                        if completed_output is None:
+                            raise ValueError(
+                                "trained author state has no authenticated completed fold"
+                            )
+                        completed_receipt_binding = _track_a_receipt_state_binding(
+                            run_dir=run_dir,
+                            fold_dir=completed_fold_dir,
+                            context=completed_context,
+                        )
+                        _publish_track_a_author_between_fold_state(
+                            state_dir=state_dir,
+                            configuration_sha256=configuration_sha,
+                            model=model,
+                            optimizer=optimizer,
+                            completed_fold=completed_fold,
+                            fold_batch=folds,
+                            epochs_per_fold=int(published["epochs"]),
+                            receipt_binding=completed_receipt_binding,
+                        )
+                        completed_prior[completed_fold] = completed_output
+                        preceding_receipt_binding = completed_receipt_binding
+                        next_fold = completed_fold + 1
+                        resume_epoch = 0
+                        phase = "between_folds"
 
                 for fold in folds:
                     if fold < next_fold:
@@ -2861,6 +2978,7 @@ def run_track_a(
                         split_sha256=split_sha,
                         code_revision=code_revision,
                         threshold_source="test_balanced_accuracy_author_audit",
+                        reconstruction_seed=reconstruction_seed,
                         checkpoint_path=fold_inference.path,
                         checkpoint_sha256=str(fold_inference.descriptor["sha256"]),
                     )
@@ -2870,30 +2988,27 @@ def run_track_a(
                         metric,
                         context=completed_context,
                     )
+                    if receipt_path != fold_dir / "receipt.json":
+                        raise RuntimeError("Track A receipt path is not deterministic")
+                    if interrupt_after_receipt == (mode, model_name, fold):
+                        raise PlannedInterruption(
+                            f"planned Track A interruption after fold receipt at "
+                            f"{mode}/{model_name}/{fold}"
+                        )
                     completed_receipt_binding = _track_a_receipt_state_binding(
                         run_dir=run_dir,
                         fold_dir=fold_dir,
                         context=completed_context,
                     )
-                    if receipt_path != fold_dir / "receipt.json":
-                        raise RuntimeError("Track A receipt path is not deterministic")
-                    _publish_checkpoint_generation(
-                        {
-                            "format_version": 1,
-                            "checkpoint_role": "latest_recovery",
-                            "track_a_configuration_sha256": configuration_sha,
-                            "model_state": model.state_dict(),
-                            "optimizer_state": optimizer.state_dict(),
-                            "next_fold": fold + 1,
-                            "completed_epoch": 0,
-                            "phase": "between_folds",
-                            "fold_batch": list(folds),
-                            "rng_state": _rng_state(),
-                            **completed_receipt_binding,
-                        },
-                        state_dir,
-                        role="latest_recovery",
-                        epoch=(fold + 1) * int(published["epochs"]),
+                    _publish_track_a_author_between_fold_state(
+                        state_dir=state_dir,
+                        configuration_sha256=configuration_sha,
+                        model=model,
+                        optimizer=optimizer,
+                        completed_fold=fold,
+                        fold_batch=folds,
+                        epochs_per_fold=int(published["epochs"]),
+                        receipt_binding=completed_receipt_binding,
                     )
                     next_fold = fold + 1
                     resume_epoch = 0
@@ -2954,6 +3069,7 @@ def run_track_a(
                             split_sha256=split_sha,
                             code_revision=code_revision,
                             threshold_source="inner_validation_balanced_accuracy",
+                            reconstruction_seed=reconstruction_seed + fold,
                             checkpoint_path=inference.path,
                             checkpoint_sha256=str(inference.descriptor["sha256"]),
                         )
@@ -3054,6 +3170,7 @@ def run_track_a(
                         split_sha256=split_sha,
                         code_revision=code_revision,
                         threshold_source="inner_validation_balanced_accuracy",
+                        reconstruction_seed=reconstruction_seed + fold,
                         checkpoint_path=fitted.checkpoint_path,
                         checkpoint_sha256=fitted.checkpoint_sha256,
                     )

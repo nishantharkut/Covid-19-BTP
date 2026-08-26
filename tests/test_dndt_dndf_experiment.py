@@ -1131,7 +1131,10 @@ def test_rfecv_cache_is_global_hashed_and_recomputed_after_corruption(
         "source_hashes",
         "sklearn_version",
         "algorithm_settings",
+        "rfecv_scope",
         "cache_key",
+        "extra_manifest_field",
+        "missing_manifest_field",
         "selected_features_bytes",
         "selected_indices_bytes",
     ),
@@ -1168,8 +1171,14 @@ def test_rfecv_cache_rejects_every_provenance_or_byte_corruption(
         manifest["sklearn_version"] = "0.0-corrupt"
     elif corruption == "algorithm_settings":
         manifest["algorithm"]["rfecv"]["step"] = 2
+    elif corruption == "rfecv_scope":
+        manifest["rfecv_scope"] = "per_fold"
     elif corruption == "cache_key":
         manifest["cache_key"] = _sha("wrong-key")
+    elif corruption == "extra_manifest_field":
+        manifest["unexpected"] = "not-allowed"
+    elif corruption == "missing_manifest_field":
+        del manifest["rfecv_scope"]
     elif corruption == "selected_features_bytes":
         (cached.manifest_path.parent / "selected_features.npy").write_bytes(b"corrupt")
     elif corruption == "selected_indices_bytes":
@@ -1195,6 +1204,8 @@ def test_rfecv_cache_rejects_every_provenance_or_byte_corruption(
     )
     assert repaired_manifest["source_hashes"] == artifacts.source_hashes
     assert repaired_manifest["cache_key"] == repaired.cache_key
+    assert repaired_manifest["rfecv_scope"] == "single_global_author_pass"
+    assert "unexpected" not in repaired_manifest
 
 
 def test_rfecv_expected_index_assertion_rejects_drift(
@@ -1354,6 +1365,127 @@ def test_author_fold_batch_resume_matches_uninterrupted_and_writes_atomic_receip
         run_track_a(config, run_id="resumed", resume=True, **common)
 
 
+def test_author_receipt_crash_resume_never_repeats_outer_test_evaluation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import covid_rars.dndt_dndf_experiment as experiment
+
+    artifacts = _tiny_track_a_artifacts()
+    full_root = tmp_path / "full"
+    resumed_root = tmp_path / "resumed"
+    full_cache = _tiny_track_a_cache(full_root)
+    resumed_cache = _tiny_track_a_cache(resumed_root)
+    calls = {"full": 0, "resumed": 0}
+    threshold_calls = {"full": 0, "resumed": 0}
+    active_run = "full"
+    original = experiment._predict_track_a_outer_test
+    original_threshold_sweep = experiment.author_threshold_sweep
+
+    def counting_outer_test(*args: object, **kwargs: object) -> np.ndarray:
+        calls[active_run] += 1
+        return original(*args, **kwargs)
+
+    def counting_threshold_sweep(*args: object, **kwargs: object) -> dict[str, float | int]:
+        threshold_calls[active_run] += 1
+        return original_threshold_sweep(*args, **kwargs)
+
+    monkeypatch.setattr(
+        experiment,
+        "_predict_track_a_outer_test",
+        counting_outer_test,
+    )
+    monkeypatch.setattr(
+        experiment,
+        "author_threshold_sweep",
+        counting_threshold_sweep,
+    )
+    common = {
+        "run_id": "receipt-window",
+        "artifacts": artifacts,
+        "fold_batch": (0,),
+        "modes": ("author_behaviour_audit",),
+        "model_names": ("dndt",),
+        "code_revision": "task4-receipt-window-test",
+        "device": "cpu",
+    }
+    full = run_track_a(
+        _tiny_track_a_config(full_root),
+        feature_cache=full_cache,
+        **common,
+    )
+    assert calls["full"] == 1
+    assert threshold_calls["full"] == 1
+
+    active_run = "resumed"
+    with pytest.raises(PlannedInterruption, match="after fold receipt"):
+        run_track_a(
+            _tiny_track_a_config(resumed_root),
+            feature_cache=resumed_cache,
+            interrupt_after_receipt=("author_behaviour_audit", "dndt", 0),
+            **common,
+        )
+    assert calls["resumed"] == 1
+    assert threshold_calls["resumed"] == 1
+    interrupted_state = _resolve_checkpoint_manifest(
+        resumed_root
+        / "runs"
+        / "receipt-window"
+        / "track_a"
+        / "author_behaviour_audit"
+        / "dndt"
+        / "state",
+        role="latest_recovery",
+        map_location="cpu",
+    )
+    assert interrupted_state.payload["phase"] == "trained"
+    assert interrupted_state.payload["next_fold"] == 0
+
+    resumed = run_track_a(
+        _tiny_track_a_config(resumed_root),
+        feature_cache=resumed_cache,
+        resume=True,
+        **common,
+    )
+    assert calls["resumed"] == 1
+    assert threshold_calls["resumed"] == 1
+    pd.testing.assert_frame_equal(
+        pd.DataFrame(full["predictions"]),
+        pd.DataFrame(resumed["predictions"]),
+    )
+    pd.testing.assert_frame_equal(
+        pd.DataFrame(full["metrics"]),
+        pd.DataFrame(resumed["metrics"]),
+        check_like=True,
+    )
+
+    relative_receipt = (
+        Path("track_a")
+        / "author_behaviour_audit"
+        / "dndt"
+        / "fold_00"
+        / "receipt.json"
+    )
+    full_run = full_root / "runs" / "receipt-window"
+    resumed_run = resumed_root / "runs" / "receipt-window"
+    assert (full_run / relative_receipt).read_bytes() == (
+        resumed_run / relative_receipt
+    ).read_bytes()
+    full_state = _resolve_checkpoint_manifest(
+        full_run / "track_a" / "author_behaviour_audit" / "dndt" / "state",
+        role="latest_recovery",
+        map_location="cpu",
+    )
+    resumed_state = _resolve_checkpoint_manifest(
+        resumed_run / "track_a" / "author_behaviour_audit" / "dndt" / "state",
+        role="latest_recovery",
+        map_location="cpu",
+    )
+    assert full_state.payload["phase"] == resumed_state.payload["phase"] == "between_folds"
+    assert full_state.payload["next_fold"] == resumed_state.payload["next_fold"] == 1
+    assert full_state.descriptor["sha256"] == resumed_state.descriptor["sha256"]
+
+
 def test_track_a_predictions_carry_complete_fold_provenance(tmp_path: Path) -> None:
     artifacts = _tiny_track_a_artifacts()
     cache = _tiny_track_a_cache(tmp_path)
@@ -1406,6 +1538,11 @@ def test_track_a_predictions_carry_complete_fold_provenance(tmp_path: Path) -> N
         "checkpoint_sha256",
         "predictions_sha256",
         "metrics_sha256",
+        "global_feature_selection_retained",
+        "released_preprocessed_array_retained",
+        "author_training_order",
+        "author_randomness_unseeded",
+        "reconstruction_seed",
     ),
 )
 def test_completed_fold_resume_rejects_each_tampered_receipt_provenance_field(
@@ -1435,6 +1572,40 @@ def test_completed_fold_resume_rejects_each_tampered_receipt_provenance_field(
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
 
     with pytest.raises(ValueError, match="authenticated fold"):
+        _resume_copied_corrected_track_a(config, artifacts, cache)
+
+
+@pytest.mark.parametrize("mutation", ("extra", "missing"))
+def test_completed_fold_resume_rejects_nonexact_receipt_schema(
+    tmp_path: Path,
+    completed_corrected_track_a_template: tuple[
+        Path,
+        AuthorTrackAArtifacts,
+        TrackAFeatureCache,
+        dict[str, object],
+    ],
+    mutation: str,
+) -> None:
+    run_dir, artifacts, cache, config = _copied_corrected_track_a_case(
+        tmp_path,
+        completed_corrected_track_a_template,
+    )
+    receipt_path = (
+        run_dir
+        / "track_a"
+        / "corrected_reference"
+        / "dndt"
+        / "fold_00"
+        / "receipt.json"
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if mutation == "extra":
+        receipt["unexpected"] = "not-allowed"
+    else:
+        del receipt["author_training_order"]
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="authenticated fold receipt schema"):
         _resume_copied_corrected_track_a(config, artifacts, cache)
 
 
