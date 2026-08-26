@@ -39,6 +39,7 @@ from covid_rars.dndt_dndf_experiment import (
     _participant_validation_arrays,
     _resolve_checkpoint_manifest,
     _track_b_checkpoint_input_sha256,
+    _track_b_metric_matches,
     _track_b_study_name,
     aggregate_participant_probabilities,
     author_threshold_to_covid_threshold,
@@ -68,6 +69,14 @@ from covid_rars.dndt_dndf_models import ModelConfig
 from covid_rars.dndt_dndf_evidence import complete_metric_bundle
 from covid_rars.features import feature_columns
 from covid_rars.metrics import best_threshold_by_balanced_accuracy
+
+
+def test_track_b_metric_comparison_accepts_csv_round_trip_noise_only() -> None:
+    stored_nll = 2.1340056668628056
+    recomputed_nll = 2.1340056668628082
+
+    assert _track_b_metric_matches(stored_nll, recomputed_nll)
+    assert not _track_b_metric_matches(stored_nll, recomputed_nll + 1e-8)
 
 
 def _fusion_prediction_fixture() -> pd.DataFrame:

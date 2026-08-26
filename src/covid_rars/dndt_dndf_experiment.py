@@ -2855,9 +2855,15 @@ def _load_track_b_execution_receipt(
     if metric_file != metrics:
         raise ValueError("Track B metric artifact differs from receipt")
     for key, value in recomputed_metrics.items():
-        if not math.isclose(float(metrics.get(key, float("nan"))), value, rel_tol=0.0, abs_tol=1e-15):
+        if not _track_b_metric_matches(
+            float(metrics.get(key, float("nan"))), value
+        ):
             raise ValueError(f"Track B metric is not recomputable: {key}")
     return receipt
+
+
+def _track_b_metric_matches(stored: float, recomputed: float) -> bool:
+    return math.isclose(stored, recomputed, rel_tol=1e-14, abs_tol=1e-14)
 
 
 def _load_track_b_selected_configurations(
