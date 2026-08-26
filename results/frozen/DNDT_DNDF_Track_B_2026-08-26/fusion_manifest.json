@@ -1,0 +1,56 @@
+{
+  "artifacts": {
+    "metrics": {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/fusion_metrics.csv",
+      "sha256": "a99b96b739d6ca9a5c92d1d3d386ed4fabfefa2199fe5b5735aa4e0ffdc7242e"
+    },
+    "participant_predictions": {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/fusion_participant_predictions.csv",
+      "sha256": "6c52344ce38e5630389b4068828d328a3836fa84b924887c470110dde3df968a"
+    },
+    "weights": {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/fusion_weights.csv",
+      "sha256": "a271a9d2d4538b03939b242bc2b97ef0728f00dcf9067fe9ca0efbdc6d511621"
+    }
+  },
+  "authenticated_receipts": [
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/fusion/seed_42/validation_logistic_stack/completion.json",
+      "sha256": "9e1a041b7f6497541f45169edd8bca47e966cc667197e3692b999ca4ad0eec20"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/fusion/seed_42/uniform_mean/completion.json",
+      "sha256": "9ed6dd438900fc061824b2af2f58b2c0f0400df584872903135eecbb8903fef2"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/fusion/seed_314/validation_logistic_stack/completion.json",
+      "sha256": "ecb9eb7ac480f979072bfe6dc11fa6d006021506777a58844fc3b267127a9b4d"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/fusion/seed_314/uniform_mean/completion.json",
+      "sha256": "e2ac6a34e42c8d88362d857ed4724b7cd0e618c013dfa115937ce8c4ceae3db5"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/fusion/seed_2026/validation_logistic_stack/completion.json",
+      "sha256": "5d281460ac8f69127c879eb0de24a47a0d4d96aef0b60f723a6c686e43b45057"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/fusion/seed_2026/uniform_mean/completion.json",
+      "sha256": "77b148eb7032fbc2c9d8f24f60640d8e1298a2cc79ac826662f9ec3645fd5f58"
+    }
+  ],
+  "code_revision": "00cfeb8bca2408e1351b30e3f5202c26d40fb2ec",
+  "completed_units": 6,
+  "execution_backend": "cuda:0",
+  "format_version": 1,
+  "run_id": "dndt-dndf-final-20260826",
+  "seeds": [
+    42,
+    314,
+    2026
+  ],
+  "stage": "fusion",
+  "status": "complete",
+  "total_units": 6,
+  "track": "B"
+}

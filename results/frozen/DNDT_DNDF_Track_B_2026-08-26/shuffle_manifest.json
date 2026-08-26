@@ -1,0 +1,63 @@
+{
+  "artifacts": {
+    "metrics": {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/shuffle_metrics.csv",
+      "sha256": "147a06170c24be524be0ff106e917171614536971923ac102c02b44553f28896"
+    },
+    "participant_predictions": {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/shuffle_participant_predictions.csv",
+      "sha256": "e2457c4ec5cf59dbb13737c89856340cb64ba0df7e594313d0e92b1d253c359a"
+    },
+    "recording_predictions": {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/shuffle_recording_predictions.csv",
+      "sha256": "dbc472c6af643a1fcff3fea80dfe39182d4a1e682cd803e9f53b91e5c4c9d707"
+    }
+  },
+  "authenticated_receipts": [
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/shuffle/shuffle/breath/dndf/seed_42/completion.json",
+      "sha256": "c9206601af00ee0c7253faaf098207feedd59a0eb9bd46785bbdfce988595dad"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/shuffle/shuffle/cough/dndf/seed_42/completion.json",
+      "sha256": "ad84a9a28051940dc126ca9bed69567a2bbe2a3f8d1983545459e61ed013bd4a"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/shuffle/shuffle/speech/dndf/seed_42/completion.json",
+      "sha256": "94e576d88678fe9ad54a35a8bb9b66367dd865a1a9537057cb7be8c4ad8c353e"
+    }
+  ],
+  "completed_units": 3,
+  "control_scope": "single_permutation_fit_stage_sanity_check",
+  "execution_backend": "cuda:0",
+  "modalities": [
+    "breath",
+    "cough",
+    "speech"
+  ],
+  "permutation_seed": 42,
+  "protocols": [
+    "shuffle"
+  ],
+  "requested_scope": {
+    "modalities": [
+      "breath",
+      "cough",
+      "speech"
+    ],
+    "protocols": [
+      "shuffle"
+    ],
+    "seeds": [
+      42
+    ]
+  },
+  "run_id": "dndt-dndf-final-20260826",
+  "seeds": [
+    42
+  ],
+  "stage": "shuffle",
+  "status": "complete",
+  "total_units": 3,
+  "track": "B"
+}

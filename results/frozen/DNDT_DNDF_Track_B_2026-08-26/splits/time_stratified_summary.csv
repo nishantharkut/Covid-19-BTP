@@ -1,0 +1,10 @@
+protocol,dataset,modality,split,n_rows,n_participants,n_positive,n_negative
+time_stratified,coswara,breath,test,846,435,267,579
+time_stratified,coswara,breath,train,2401,1233,744,1657
+time_stratified,coswara,breath,validation,782,401,256,526
+time_stratified,coswara,cough,test,853,437,277,576
+time_stratified,coswara,cough,train,2450,1244,786,1664
+time_stratified,coswara,cough,validation,791,403,270,521
+time_stratified,coswara,speech,test,2097,434,664,1433
+time_stratified,coswara,speech,train,5959,1239,1871,4088
+time_stratified,coswara,speech,validation,1927,403,640,1287

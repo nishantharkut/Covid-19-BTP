@@ -1,0 +1,10 @@
+protocol,dataset,modality,split,n_rows,n_participants,n_positive,n_negative
+shuffle,coswara,breath,test,594,312,183,411
+shuffle,coswara,breath,train,2836,1449,926,1910
+shuffle,coswara,breath,validation,599,308,193,406
+shuffle,coswara,cough,test,622,316,203,419
+shuffle,coswara,cough,train,2861,1457,927,1934
+shuffle,coswara,cough,validation,611,311,199,412
+shuffle,coswara,speech,test,1503,314,488,1015
+shuffle,coswara,speech,train,6988,1451,2277,4711
+shuffle,coswara,speech,validation,1492,311,477,1015

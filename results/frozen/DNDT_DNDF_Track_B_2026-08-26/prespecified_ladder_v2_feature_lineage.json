@@ -1,0 +1,109 @@
+{
+  "format_version": 1,
+  "protocols": {
+    "early_to_late": {
+      "feature_sha256": "aa116ffbb562b94be59f7af6ab8562ba4e9748dc8a8e9b3cddd1b64b2ab6eeeb",
+      "modalities": {
+        "breath": {
+          "configuration_selection_source": "author_published_configuration",
+          "feature_selection_artifact_sha256": "65b5e56737cf810224720c01a0c5e9bf57c4d5405936f3cf39a80cff1ef5c80b",
+          "feature_selection_scope": "protocol_train_only",
+          "selected_configuration_sha256": "512daa13096e4b88a34d8f882434ad46636a602cc9d7b9c367fe2d54998c231c"
+        },
+        "cough": {
+          "configuration_selection_source": "author_published_configuration",
+          "feature_selection_artifact_sha256": "65b5e56737cf810224720c01a0c5e9bf57c4d5405936f3cf39a80cff1ef5c80b",
+          "feature_selection_scope": "protocol_train_only",
+          "selected_configuration_sha256": "2ca93a912b763db16e6069a47bce161f80528527ed0aa7bc334a5cd4eafe6569"
+        },
+        "speech": {
+          "configuration_selection_source": "author_published_configuration",
+          "feature_selection_artifact_sha256": "65b5e56737cf810224720c01a0c5e9bf57c4d5405936f3cf39a80cff1ef5c80b",
+          "feature_selection_scope": "protocol_train_only",
+          "selected_configuration_sha256": "635bf79cdf4cab2694fc8cdc9dbd6dd08131eb3c66f499286fa9b33657b16423"
+        }
+      },
+      "source_sha256": {
+        "metadata": "a63e24cd9c2b148084bc45d4303f48a205520eda44ea89da4319760da8eda65f",
+        "project": "cef9c4da6fc9d16814a8aecd32fa528fc422800f4b2874e4e78160e918a1f0e8"
+      },
+      "split_sha256": "94fca28e1388f3605cc719c50572f3e3caaa48180a4b45926ff8f60714a4c587"
+    },
+    "existing": {
+      "feature_sha256": "9a0970f6f566effc8343ba3be608c5496957443b38121e166352f3cb32d3fc9f",
+      "modalities": {
+        "breath": {
+          "configuration_selection_source": "author_published_configuration",
+          "feature_selection_artifact_sha256": "686af945fc551d5303a628b07095b0267cc4b2733a3f564b8c8033cc68543465",
+          "feature_selection_scope": "frozen_existing_train_only_top800",
+          "selected_configuration_sha256": "6a2c3b2bf04297c7cb9e13a406c88083e25ba218cf5dd57a2294a22047ba99d3"
+        },
+        "cough": {
+          "configuration_selection_source": "author_published_configuration",
+          "feature_selection_artifact_sha256": "686af945fc551d5303a628b07095b0267cc4b2733a3f564b8c8033cc68543465",
+          "feature_selection_scope": "frozen_existing_train_only_top800",
+          "selected_configuration_sha256": "155a46ba47a4c9cdff82470b950a2ca8f579555107490e9b2d96669952629121"
+        },
+        "speech": {
+          "configuration_selection_source": "author_published_configuration",
+          "feature_selection_artifact_sha256": "686af945fc551d5303a628b07095b0267cc4b2733a3f564b8c8033cc68543465",
+          "feature_selection_scope": "frozen_existing_train_only_top800",
+          "selected_configuration_sha256": "5b6a3740c12920875e3925ebcef24ba5105444f68002c59aa591fd4805b83a70"
+        }
+      },
+      "source_sha256": {
+        "external": "9997b34326d1ac1c69e77eaf99ec0c9dac638e2fc3ffa3a5b78b0c2266045321",
+        "metadata": "a63e24cd9c2b148084bc45d4303f48a205520eda44ea89da4319760da8eda65f",
+        "project": "686af945fc551d5303a628b07095b0267cc4b2733a3f564b8c8033cc68543465"
+      },
+      "split_sha256": "7fb604858c9222be37c0bb749fc4812006828401158ece70952d67136d454ff3"
+    },
+    "external_cough": {
+      "feature_sha256": "9a0970f6f566effc8343ba3be608c5496957443b38121e166352f3cb32d3fc9f",
+      "modalities": {
+        "cough": {
+          "configuration_selection_source": "author_published_configuration",
+          "feature_selection_artifact_sha256": "686af945fc551d5303a628b07095b0267cc4b2733a3f564b8c8033cc68543465",
+          "feature_selection_scope": "frozen_existing_train_only_top800",
+          "selected_configuration_sha256": "3daeb9603429b22cfc6a891ff7f2aa73eb8c0dabe9b20d6dfce592e0daac70c3"
+        }
+      },
+      "source_sha256": {
+        "external": "9997b34326d1ac1c69e77eaf99ec0c9dac638e2fc3ffa3a5b78b0c2266045321",
+        "metadata": "a63e24cd9c2b148084bc45d4303f48a205520eda44ea89da4319760da8eda65f",
+        "project": "686af945fc551d5303a628b07095b0267cc4b2733a3f564b8c8033cc68543465"
+      },
+      "split_sha256": "93961ef5c70ab921703c3c57fd5473dcb0853e6e41c11dd233bf8ddc52a24f0f"
+    },
+    "time_stratified": {
+      "feature_sha256": "02daa58467942d221fac1f4e6ee9c0286ece2d5f6f32281e5193697b1d24c7e7",
+      "modalities": {
+        "breath": {
+          "configuration_selection_source": "author_published_configuration",
+          "feature_selection_artifact_sha256": "3742078c8189b21866caa18e2a81c3fe29e2282beabfb27fc5b7fc6b467cbf90",
+          "feature_selection_scope": "protocol_train_only",
+          "selected_configuration_sha256": "406718490435e3c3d8f03d576515f607c9503f3dc5ad0c57dec6f18a71bcf38d"
+        },
+        "cough": {
+          "configuration_selection_source": "author_published_configuration",
+          "feature_selection_artifact_sha256": "3742078c8189b21866caa18e2a81c3fe29e2282beabfb27fc5b7fc6b467cbf90",
+          "feature_selection_scope": "protocol_train_only",
+          "selected_configuration_sha256": "acb5225b2463c3e587aa65c4b8ce526b84ac05f5848300cf18ac57bc935064e2"
+        },
+        "speech": {
+          "configuration_selection_source": "author_published_configuration",
+          "feature_selection_artifact_sha256": "3742078c8189b21866caa18e2a81c3fe29e2282beabfb27fc5b7fc6b467cbf90",
+          "feature_selection_scope": "protocol_train_only",
+          "selected_configuration_sha256": "8cb3edb5ca3246407d5c01f5386100da0b1301c5f8f277c3514e626a7b7496db"
+        }
+      },
+      "source_sha256": {
+        "metadata": "a63e24cd9c2b148084bc45d4303f48a205520eda44ea89da4319760da8eda65f",
+        "project": "cef9c4da6fc9d16814a8aecd32fa528fc422800f4b2874e4e78160e918a1f0e8"
+      },
+      "split_sha256": "7585df690797f86438a99157dc2fbe4628f7d26f10edb4fec7403745abcd5d30"
+    }
+  },
+  "run_id": "dndt-dndf-final-20260826",
+  "stage": "prespecified_ladder_v2"
+}

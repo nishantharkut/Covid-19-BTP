@@ -1,0 +1,4 @@
+protocol,dataset,modality,split,n_rows,n_participants,n_positive,n_negative
+external_cough,coswara,cough,train,2861,1457,932,1929
+external_cough,coswara,cough,validation,611,311,198,413
+external_cough,coughvid,cough,external,8331,8331,285,8046

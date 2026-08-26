@@ -1,0 +1,10 @@
+protocol,dataset,modality,split,n_rows,n_participants,n_positive,n_negative
+early_to_late,coswara,breath,test,780,411,637,143
+early_to_late,coswara,breath,train,2450,1241,188,2262
+early_to_late,coswara,breath,validation,799,417,442,357
+early_to_late,coswara,cough,test,818,419,664,154
+early_to_late,coswara,cough,train,2446,1244,195,2251
+early_to_late,coswara,cough,validation,830,421,474,356
+early_to_late,coswara,speech,test,1944,416,1592,352
+early_to_late,coswara,speech,train,6021,1240,442,5579
+early_to_late,coswara,speech,validation,2018,420,1141,877

@@ -1,0 +1,175 @@
+{
+  "artifacts": {
+    "feature_lineage": {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/prespecified_ladder_v2_feature_lineage.json",
+      "sha256": "932dfddabdaa9a88688e13bac784743fc47dfd0560d525883a88797d8f76c1cb"
+    },
+    "metrics": {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/prespecified_ladder_v2_metrics.csv",
+      "sha256": "89a4141f37d666dff620c11943be2c797dda9d2a6f2406255e8ddcd855cb6824"
+    },
+    "participant_predictions": {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/prespecified_ladder_v2_participant_predictions.csv",
+      "sha256": "97bef636c9ba9bd0d075b398279e038bf76a23f2a6ff6928ac0fef88ee30eb3f"
+    },
+    "recording_predictions": {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/prespecified_ladder_v2_recording_predictions.csv",
+      "sha256": "ddd879604acc9f482f503388aedc82c3bec832fd81f235efc2cc853480b3acb1"
+    }
+  },
+  "authenticated_receipts": [
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/early_to_late/breath/dndf/seed_42/completion.json",
+      "sha256": "196bfa892600046f74ce325892d4b4ee2d4f70fadad6a1c55c406028b8fd1bf4"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/early_to_late/breath/dndf/seed_314/completion.json",
+      "sha256": "0f821d0b9dc915d49c4a9e99bc31e92f3e0209901e6293e6d12d0d5b85cc91d2"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/early_to_late/breath/dndf/seed_2026/completion.json",
+      "sha256": "40bad71928c6fe72c36fc234e951e2e7b66ab84d3c1e8225a1f55dfcd0a8a27b"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/early_to_late/cough/dndf/seed_42/completion.json",
+      "sha256": "a6a3f48a3d1317c23d458fe92a4e9b40bfb154f3487b8d3749cd19f1200f2881"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/early_to_late/cough/dndf/seed_314/completion.json",
+      "sha256": "12829c29e69a04edbef0897786e8063ecd04445719710d8340d04d5c982d52fc"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/early_to_late/cough/dndf/seed_2026/completion.json",
+      "sha256": "b7464385687ed7d037c0371b4ca60bd2f410f878a162d05bd92eb080e058e1a6"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/early_to_late/speech/dndf/seed_42/completion.json",
+      "sha256": "929307021d81034dbcbb5a50ca4898522ffda2425e3750e9ad719bd8bc87e36d"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/early_to_late/speech/dndf/seed_314/completion.json",
+      "sha256": "13c9fed8f091aca51ec8f7a0c15d0d0eb5c9c2922ebb299a056c90ee25656e3d"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/early_to_late/speech/dndf/seed_2026/completion.json",
+      "sha256": "666f059e5cea10a9cfee4e7f8f118796cdea379a1f2322b7fbce4b91fa421adf"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/existing/breath/dndf/seed_42/completion.json",
+      "sha256": "acac01a3c1de994c521db53f7b96ca43d6acddfca1afaf4796062eeb0e0dd587"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/existing/breath/dndf/seed_314/completion.json",
+      "sha256": "0cc1f742cbebbf790a31b941e5e4590e4d58662a68d777edee5f26b68cb3a56d"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/existing/breath/dndf/seed_2026/completion.json",
+      "sha256": "2a702af6e153d9ad59a6fabdc99b6cec42ba83ba2db2ec5ee6517880a0e15afa"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/existing/cough/dndf/seed_42/completion.json",
+      "sha256": "60e9285c32ac5283acc29db4f20ab53eebefb055a06b2838da5c09f7fc41202e"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/existing/cough/dndf/seed_314/completion.json",
+      "sha256": "db4619869c1632865930b5c852167d029e6ada3244633f28cf5cf1ac6393369a"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/existing/cough/dndf/seed_2026/completion.json",
+      "sha256": "c86be01149dc35087bdf392b0ed6663e2308b1c7cda2b9c33507555466848f14"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/existing/speech/dndf/seed_42/completion.json",
+      "sha256": "5db4ea4b4121a03261d7859359d58c49a856b918466e3e9d32f0e47c600f7d7f"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/existing/speech/dndf/seed_314/completion.json",
+      "sha256": "c816673d0a6bf91ef936d9cd000f68de5f96cc85e2734720216c8e38a9c6acc0"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/existing/speech/dndf/seed_2026/completion.json",
+      "sha256": "e4cf6a8eda7bb786fa3ceb1d86518b183990464d405af0411756663796fa048f"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/time_stratified/breath/dndf/seed_42/completion.json",
+      "sha256": "4a09b5fda11ff52a80fa3666488ade8c9fe4c0fe14addb7386fa3411ca04adc2"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/time_stratified/breath/dndf/seed_314/completion.json",
+      "sha256": "4d5689dca0cf99c2c84b0b60c3dc366f37f9e333c7273d9f2dcd15fca21411ff"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/time_stratified/breath/dndf/seed_2026/completion.json",
+      "sha256": "440ba447d1b684b920a97f6e5b5c40855a1a544f6c8d527a44fd8f79b067c2cd"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/time_stratified/cough/dndf/seed_42/completion.json",
+      "sha256": "6a5d8e96bee9c679ee1a5ff6dba46b9b80099a531071decbaa209d687cfa5d13"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/time_stratified/cough/dndf/seed_314/completion.json",
+      "sha256": "e4b0826f61eb818411974544011427f0f135546d0e7def0b0ad8788d4a427a6c"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/time_stratified/cough/dndf/seed_2026/completion.json",
+      "sha256": "2a3ddfab78950937ed9e0d2db5130bea449247d13444b2dd1688f6c91adc2630"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/time_stratified/speech/dndf/seed_42/completion.json",
+      "sha256": "c29aa2fa043ab16235d4ae1524b1e928ae915ec37a1d728f9a3d5bd696ac709e"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/time_stratified/speech/dndf/seed_314/completion.json",
+      "sha256": "8c6f81e2ddbe1510d910e98175b7ebf66880e83ce97fb0d45245118c01e123cd"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/time_stratified/speech/dndf/seed_2026/completion.json",
+      "sha256": "f6791435d8fdb67c890423ea6506a1bd8634da839c1c211e66e9c6719df6db78"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/prespecified_ladder_v2/external_cough/cough/dndf/seed_42/completion.json",
+      "sha256": "72aa67fdd1cffdc3066dd12f106a5801ea5d3387a26aa4884ee7146be0b4b464"
+    }
+  ],
+  "completed_units": 28,
+  "execution_backend": "cuda:0",
+  "modalities": [
+    "breath",
+    "cough",
+    "speech"
+  ],
+  "protocols": [
+    "early_to_late",
+    "existing",
+    "external_cough",
+    "time_stratified"
+  ],
+  "requested_scope": {
+    "modalities": [
+      "breath",
+      "cough",
+      "speech"
+    ],
+    "protocols": [
+      "early_to_late",
+      "existing",
+      "external_cough",
+      "time_stratified"
+    ],
+    "seeds": [
+      42,
+      314,
+      2026
+    ]
+  },
+  "run_id": "dndt-dndf-final-20260826",
+  "seeds": [
+    42,
+    314,
+    2026
+  ],
+  "stage": "prespecified_ladder_v2",
+  "status": "complete",
+  "total_units": 28,
+  "track": "B"
+}

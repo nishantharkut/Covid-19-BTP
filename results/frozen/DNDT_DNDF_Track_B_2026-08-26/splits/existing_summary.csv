@@ -1,0 +1,10 @@
+protocol,dataset,modality,split,n_rows,n_participants,n_positive,n_negative
+existing,coswara,breath,test,594,312,183,411
+existing,coswara,breath,train,2836,1449,897,1939
+existing,coswara,breath,validation,599,308,187,412
+existing,coswara,cough,test,622,316,203,419
+existing,coswara,cough,train,2861,1457,932,1929
+existing,coswara,cough,validation,611,311,198,413
+existing,coswara,speech,test,1503,314,488,1015
+existing,coswara,speech,train,6988,1451,2206,4782
+existing,coswara,speech,validation,1492,311,481,1011

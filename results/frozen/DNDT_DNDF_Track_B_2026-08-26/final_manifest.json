@@ -1,0 +1,89 @@
+{
+  "artifacts": {
+    "metrics": {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/final_metrics.csv",
+      "sha256": "2fb425c32b276745a9ba9f4e0e1afa7a6fc1b23f815f4ae39ba1764ce67faae7"
+    },
+    "participant_predictions": {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/final_participant_predictions.csv",
+      "sha256": "508e7d8bdcf6a3cad0643ecfd4900f2d47a0e3ab004ace552ff8f6d15212eaed"
+    },
+    "recording_predictions": {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/final_recording_predictions.csv",
+      "sha256": "c2b0f38b1ed550843c6cfcd49bec13e892143de2e7bc2db60baf0c044cf52c4d"
+    }
+  },
+  "authenticated_receipts": [
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/final/existing/breath/dndf/seed_42/completion.json",
+      "sha256": "975e1b31e9cd75c93086b9a46e879190f6638c223dda8ba75ea175b01e437233"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/final/existing/breath/dndf/seed_314/completion.json",
+      "sha256": "9025bd5dd78e222390bbfc72d83cb54a317bbfe8f7ee1054f3920a7ea24199ac"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/final/existing/breath/dndf/seed_2026/completion.json",
+      "sha256": "259b7ed6f2677ca70f5e127c3b5d7aa7e8f41d37d01f97ab815dcb8d34f0b0d7"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/final/existing/cough/dndf/seed_42/completion.json",
+      "sha256": "7ad5f2fa52b70bc821e3ca33e196c67a8d46824bbd5895261e6424cc1dc5984d"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/final/existing/cough/dndf/seed_314/completion.json",
+      "sha256": "a1945d721ea161a90f2364f2f8946be7708e410702ec53e1f90ffdbf4349b33a"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/final/existing/cough/dndf/seed_2026/completion.json",
+      "sha256": "89bc8aa26d578f7ddba9dad06d7cb63544634c2b5a774e97f37162f5a3503664"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/final/existing/speech/dndf/seed_42/completion.json",
+      "sha256": "678c58abc7fe7dea503c60c7993ba749d6bee810a81c1cd737d0f127d9940dac"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/final/existing/speech/dndf/seed_314/completion.json",
+      "sha256": "89d27cb20cef76ff0611fb72d5a0aab574263fa75f2b44ba993b19be605fa9a9"
+    },
+    {
+      "path": "/home/covid/Desktop/Covid-RARS-runtime/dndt-dndf/runs/dndt-dndf-final-20260826/track_b/units/final/existing/speech/dndf/seed_2026/completion.json",
+      "sha256": "304efcae264b10b9303e7b684780473dff23dcd243354b4a9290ab2b8266b88e"
+    }
+  ],
+  "completed_units": 9,
+  "execution_backend": "cuda:0",
+  "modalities": [
+    "breath",
+    "cough",
+    "speech"
+  ],
+  "protocols": [
+    "existing"
+  ],
+  "requested_scope": {
+    "modalities": [
+      "breath",
+      "cough",
+      "speech"
+    ],
+    "protocols": [
+      "existing"
+    ],
+    "seeds": [
+      42,
+      314,
+      2026
+    ]
+  },
+  "run_id": "dndt-dndf-final-20260826",
+  "seeds": [
+    42,
+    314,
+    2026
+  ],
+  "stage": "final",
+  "status": "complete",
+  "total_units": 9,
+  "track": "B"
+}

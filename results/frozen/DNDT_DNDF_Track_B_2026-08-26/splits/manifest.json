@@ -1,0 +1,28 @@
+{
+  "protocols": {
+    "early_to_late": {
+      "assignments_sha256": "52ca67c65c017c321cf449955c65f6ebac4cf4258a1e9d40c95a0bab7aa75e5d",
+      "source_lineage": "coswara",
+      "split_sha256": "94fca28e1388f3605cc719c50572f3e3caaa48180a4b45926ff8f60714a4c587",
+      "summary_sha256": "c77aef0d1872c946555f4e01bf44838a3038910b9f8894326b59e11fbf4e4edc"
+    },
+    "existing": {
+      "assignments_sha256": "acae64369f28bca95f113b51b4620b156b0c7ab4484709bbc2aa08e7ddf535af",
+      "source_lineage": "coswara",
+      "split_sha256": "7fb604858c9222be37c0bb749fc4812006828401158ece70952d67136d454ff3",
+      "summary_sha256": "e05eb4013267485760003e5fd6ba9c6da5949695e773998bec1dc64046e008cc"
+    },
+    "external_cough": {
+      "assignments_sha256": "ece528121013e9939ede114edc95a7ff75030a8dc1153a336532ac8218479e23",
+      "source_lineage": "coswara_to_coughvid",
+      "split_sha256": "93961ef5c70ab921703c3c57fd5473dcb0853e6e41c11dd233bf8ddc52a24f0f",
+      "summary_sha256": "4f47c6ac7b14d1f691bdb6936dc1504ba8cfb0d0978430244302288517f770e5"
+    },
+    "time_stratified": {
+      "assignments_sha256": "19e4b307a339fc4a0e84c0b5696ab988c87ef2470397447610a50c163fc7c65b",
+      "source_lineage": "coswara",
+      "split_sha256": "7585df690797f86438a99157dc2fbe4628f7d26f10edb4fec7403745abcd5d30",
+      "summary_sha256": "9085065fcb8f4593f4415b5cc0ae64e5ad3b879d7feaa563a9f51a3eeec6e93f"
+    }
+  }
+}
