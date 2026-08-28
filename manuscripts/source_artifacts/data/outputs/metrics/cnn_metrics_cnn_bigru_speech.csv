@@ -1,2 +1,0 @@
-auroc,auprc,balanced_accuracy,f1,sensitivity,specificity,brier,ece,nll,threshold,n_samples,model_name,architecture,modality,validation_auroc,validation_auprc,validation_balanced_accuracy,threshold_source
-0.6761869496500339,0.489620526153252,0.6381575976518401,0.523725834797891,0.5786407766990291,0.6976744186046512,0.23948788338764976,0.1819536735120493,0.6720829759482642,0.5020668937762705,1590.0,cnn_bigru,cnn_bigru,speech,0.6609813041495669,0.48300969699628027,0.625485636114911,validation_balanced_accuracy

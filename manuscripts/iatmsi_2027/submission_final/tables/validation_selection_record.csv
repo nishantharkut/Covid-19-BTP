@@ -1,2 +1,0 @@
-selection_split,modality_combination,fusion_method,validation_auroc,validation_auprc,test_auroc,test_auprc
-validation,cough+speech,uniform_mean,0.8421052631578948,0.7998504261619801,0.8949315575286718,0.8615595741192886

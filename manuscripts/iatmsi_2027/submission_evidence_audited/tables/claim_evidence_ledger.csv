@@ -1,6 +1,0 @@
-claim_id,displayed_value,evidence_file,row_selector,boundary
-conference_estimand,participant-disjoint Coswara source evaluation,paper_metric_table_raw.csv,table_source=compare_is10_final_validation_metrics;evaluation_protocol=compare_is10_existing_participant_split,"Internal source-domain evaluation; no temporal, external, or clinical-validity claim."
-primary_fusion_auroc,0.895,paper_metric_table_raw.csv,strong_multimodal_fusion;cough+speech;uniform_mean;test,Validation-selected fixed uniform fusion on 314 complete-case test participants.
-primary_fusion_auroc_ci,"[0.852, 0.933]",final_validation_bootstrap_ci.csv,compare_is10_final_validation_predictions;cough+speech;uniform_mean;test;auroc,Participant-resampling uncertainty for a fixed test cohort; excludes model-refit uncertainty.
-feature_selection,"top 800 of 10,140 numeric candidates",sota_compare_is10_feature_selection_summary.csv and feature construction code,k=800;ranker=lightgbm;selection_split=train;selection_scope=per_modality_mean,"The 800-feature budget was one of 500, 800, and 1,200 explored during development."
-fusion_minus_speech,descriptive +0.007 AUROC,paper_metric_table_raw.csv,uniform cough+speech test minus selected speech test,No paired CI or superiority test is available; do not call the difference significant.

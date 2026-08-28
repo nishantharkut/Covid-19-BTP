@@ -1,4 +1,0 @@
-comparison,reference,comparison_configuration,reference_auroc,comparison_auroc,delta_auroc,interpretation
-Remove year minus full metadata,Full metadata,Remove year,0.5313560094619817,0.5313560094619817,0.0,no_improvement
-Remove month minus full metadata,Full metadata,Remove month,0.5313560094619817,0.7787753599387232,0.24741935047674146,improves_temporal_generalization
-Remove year + month minus full metadata,Full metadata,Remove year + month,0.5313560094619817,0.7787753599387232,0.24741935047674146,improves_temporal_generalization

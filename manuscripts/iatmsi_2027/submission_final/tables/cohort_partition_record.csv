@@ -1,4 +1,0 @@
-split,n_participants,n_positive,n_negative,n_recordings
-train,1460,476,984,12685
-validation,312,101,211,2702
-test,316,103,213,2719

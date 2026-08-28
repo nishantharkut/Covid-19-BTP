@@ -1,5 +1,0 @@
-display_order,metadata_configuration,evaluation_protocol,base_feature_set,ablation_name,removed_features,temporal_auroc,temporal_auprc,temporal_balanced_accuracy,n_features
-1,Full metadata,temporal_early_to_late,full_safe_metadata,full_safe_metadata_full,none,0.5313560094619817,0.8366592051181282,0.4920620900022376,58.0
-2,Remove year,temporal_early_to_late,full_safe_metadata,full_safe_metadata_no_recording_year,recording_year,0.5313560094619817,0.8366592051181282,0.4920620900022376,58.0
-3,Remove month,temporal_early_to_late,full_safe_metadata,full_safe_metadata_no_recording_month,recording_month,0.7787753599387232,0.9346816950694226,0.7230073765246715,57.0
-4,Remove year + month,temporal_early_to_late,full_safe_metadata,full_safe_metadata_no_recording_year_month,recording_year;recording_month,0.7787753599387232,0.9346816950694226,0.7230073765246715,57.0

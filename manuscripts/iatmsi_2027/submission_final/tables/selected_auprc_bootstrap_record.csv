@@ -1,2 +1,0 @@
-metric,point,mean,ci_low,ci_high,confidence,n_bootstraps,n_samples,prediction_source,evaluation_protocol,analysis_family,model_name,modality,submodality,modality_combination,fusion_method,feature_strategy,selected_feature_k,metric_split,split
-auprc,0.8615595741192886,0.8619463574587944,0.8015827549621626,0.9090165808207616,0.95,1000,314,compare_is10_final_validation_predictions,compare_is10_existing_participant_split,strong_multimodal_fusion,strong_baseline_selected_fusion,multimodal,cough+speech,cough+speech,uniform_mean,compare_is10_top800_lightgbm,800.0,test,test

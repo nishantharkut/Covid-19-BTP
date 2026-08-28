@@ -99,3 +99,6 @@ manuscripts/**/tmp/
 manuscripts/**/*_preview.png
 manuscripts/**/*_extracted.txt
 manuscripts/**/iatmsi_text.txt
+
+# Manuscript working tree is maintained locally, outside version control
+/manuscripts/
